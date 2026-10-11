@@ -1,3 +1,14 @@
+## [Unreleased]
+
+### Fixed
+- **Replication slot created at promotion did not reserve any WAL**
+  - `create_replication_slot()` called `pg_create_physical_replication_slot(name)` without `immediately_reserve`, so the new slot had `restart_lsn = NULL` and kept no WAL until a standby had connected through it
+  - Replication slots are not copied to the standby, therefore every failover creates a fresh, empty slot on the new primary; a standby that stays away for a while finds its WAL recycled and can never catch up (`requested WAL segment ... has already been removed`)
+  - Fix: create the slot with `immediately_reserve => true`; an existing slot that is idle and has no reserved WAL is dropped and recreated, a slot that already reserves WAL or is in use is left alone
+  - Reproduction: `test/wal-removed-repro/slotcheck.sh`
+
+---
+
 ## [1.7.5] - 2026-04-29
 
 ### Fixed
