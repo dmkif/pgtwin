@@ -1,0 +1,10 @@
+# minimal stub of ocf-shellfuncs for local RA tests
+OCF_SUCCESS=0; OCF_ERR_GENERIC=1; OCF_ERR_ARGS=2; OCF_ERR_UNIMPLEMENTED=3
+OCF_ERR_PERM=4; OCF_ERR_INSTALLED=5; OCF_ERR_CONFIGURED=6; OCF_NOT_RUNNING=7
+OCF_RUNNING_MASTER=8; OCF_FAILED_MASTER=9
+ocf_log() { local lvl=$1; shift; echo "ocf_log[$lvl]: $*" >&2; }
+ocf_exit_reason() { echo "ocf_exit_reason: $*" >&2; }
+ocf_is_true() { case "$1" in yes|true|1|YES|TRUE|True|on|ON) return 0;; *) return 1;; esac; }
+ocf_run() { "$@"; }
+have_binary() { command -v "$1" >/dev/null 2>&1; }
+__OCF_ACTION=${1:-$__OCF_ACTION}
