@@ -6,6 +6,11 @@
   - Replication slots are not copied to the standby, therefore every failover creates a fresh, empty slot on the new primary; a standby that stays away for a while finds its WAL recycled and can never catch up (`requested WAL segment ... has already been removed`)
   - Fix: create the slot with `immediately_reserve => true`; an existing slot that is idle and has no reserved WAL is dropped and recreated, a slot that already reserves WAL or is in use is left alone
   - Reproduction: `test/wal-removed-repro/slotcheck.sh`
+- **Standby start loop when the required WAL is gone from the primary**
+  - A standby whose WAL was already recycled on the primary waits in `waiting for WAL to become available`; `pg_ctl -w start` times out and the agent failed with `Failed to start PostgreSQL`. Pacemaker cleared the fail-count after `failure-timeout` and retried the identical start forever, as nothing ever fell back to `pg_basebackup`
+  - The timeline check did not help: with equal timelines it does not run, and after a timeline divergence `pg_rewind` can answer `no rewind required` while the redo segment is still missing
+  - Fix: if the start of a standby fails and the log lines written by that attempt contain `requested WAL segment ... has already been removed`, stop PostgreSQL and rebuild the standby with `pg_basebackup` (skipping `pg_rewind`), then defer to the monitor like the existing empty-PGDATA path. Only log lines written by the failed attempt are considered, with or without `logging_collector`
+  - Reproduction: `test/wal-removed-repro/`
 
 ---
 

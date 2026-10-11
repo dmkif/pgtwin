@@ -7,6 +7,26 @@ not touch any cluster.
 
 Requirements: `podman`, network access for `docker.io/library/postgres:18-trixie`.
 
+## Standby that cannot start because its WAL is gone
+
+A standby start never reaches a consistent state when the primary no longer has the WAL it needs. The
+postmaster logs `waiting for WAL to become available`, `pg_ctl -w start` times out and the agent returns
+an error. A retry cannot help, so the agent now rebuilds the standby with `pg_basebackup`.
+
+    ./setup.sh && ./mkstandby.sh && ./churn.sh            # backup without WAL, WAL then recycled
+    ./runra.sh <path-to-pgtwin> start                     # before: RC=1; after: RC=7 (rebuild running)
+    sleep 8; ./runra.sh <path-to-pgtwin> monitor          # finalizes the rebuilt standby
+    ./runra.sh <path-to-pgtwin> start                     # RC=0, standby streams
+
+The path seen in production is a timeline divergence where `pg_rewind` answers `no rewind required` and
+the start still fails, because the standby's redo segment is gone but its checkpoint record is still local:
+
+    ./setup.sh && ./mkstandby-spread.sh && ./churn.sh && ./mktimeline.sh
+    ./runra.sh <path-to-pgtwin> start
+
+`./runra.sh <path-to-pgtwin> unit` runs the unit tests of the log scan (an old error line in the log must
+not trigger a rebuild).
+
 ## Slot reservation (`slotcheck.sh`)
 
 `create_replication_slot()` runs when a node is promoted. Replication slots are not copied to the standby,
