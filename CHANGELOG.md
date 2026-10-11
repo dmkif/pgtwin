@@ -1,4 +1,4 @@
-## [Unreleased]
+## [1.7.10] - 2026-10-11
 
 ### Fixed
 - **Replication slot created at promotion did not reserve any WAL**
@@ -15,6 +15,29 @@
   - `finalize_standby_config()` writes `primary_slot_name`, but only the `pg_basebackup` path created the slot. After a `pg_rewind` recovery, a dropped slot or a rebuilt primary the walreceiver failed forever with `replication slot "..." does not exist`; the standby is consistent, so the start succeeded and nothing noticed that replication was down
   - Fix: before a standby starts, the agent checks the slot on the primary and creates it with `immediately_reserve` if it is missing. Best effort: if the primary cannot be reached the start continues as before
   - Reproduction: `test/wal-removed-repro/mkstandby-stream.sh`
+
+### Documentation
+- **NEW**: `test/wal-removed-repro/` - podman bench that reproduces all three failure modes against the real agent
+- **NEW**: `releasenotes/RELEASE_v1.7.10.md` - Release notes with upgrade notes
+
+---
+
+## [1.7.6 - 1.7.9] - 2026-08 / 2026-09
+
+Not recorded at release time; reconstructed from the git history (tag `v1.7.9`).
+
+### Fixed (pgtwin)
+- `discover_promoted_node()`: VIP-based discovery no longer breaks on `/32` VIPs (the VIP itself is the connectable identity) (#1)
+- `parse_pgpass()`: default `.pgpass` path resolved from the real home directory of `pguser`, consistent with `ensure_pgpass()` (#2)
+- `pgsql_demote()`: a self-discovered primary is rejected, so `primary_conninfo` can no longer point at the node itself (#4); the `node_list` fallback is verified before it is trusted
+- `pgsql_start()`: after `recover_standby()` the start defers to the monitor while an asynchronous basebackup is running (#5)
+- `set_promotion_eligibility()`: the promotion score is written to `master-<resource>` (the attribute Pacemaker reads) with a positive floor, so a recovering node does not contest promotion and a lone healthy primary is not demoted (#3)
+- `start_async_basebackup()`: `pg_basebackup -c fast`, so a rejoining standby does not wait for a spread checkpoint
+
+### Fixed (pgtwin-migrate)
+- `setup_subscription()`: `copy_data` is configurable and defaults to `false` for the reverse direction (#6)
+- `pgtwin_migrate_prepare_cutover_v2()`: checks the return code of `swap_vip_addresses` (#8)
+- README: parameter names and required list match the script (#9)
 
 ---
 
