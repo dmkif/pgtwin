@@ -2103,6 +2103,63 @@ validate_pg_version() {
     return 0
 }
 
+# Resolve the directory PostgreSQL writes its server log files to.
+# Prints nothing if the log goes to stderr/syslog only (no log directory).
+get_pg_log_directory() {
+    local logdir
+    logdir=$(get_pg_config_value "log_directory")
+    [ -z "$logdir" ] && return 0
+    case "$logdir" in
+        /*) echo "$logdir" ;;
+        *)  echo "${PGDATA}/${logdir}" ;;
+    esac
+}
+
+# Remember size of every server log file before a start attempt, so that
+# standby_start_failed_for_missing_wal() can look at the lines written by
+# this attempt only (never at older ones).
+snapshot_pg_logs() {
+    local snap="$1" logdir f
+    : > "$snap"
+    logdir=$(get_pg_log_directory)
+    [ -n "$logdir" ] && [ -d "$logdir" ] || return 0
+    for f in "$logdir"/*; do
+        [ -f "$f" ] && echo "$(stat -c %s "$f") $f" >> "$snap"
+    done
+}
+
+# Returns 0 if the server log lines written since snapshot_pg_logs() contain
+# the walreceiver error for a WAL segment the primary has already recycled.
+# That standby can never become consistent by waiting: it needs a new base
+# backup. Written for pgtwin 1.7.5 (standby start loop observed 2026-09-23
+# to 2026-10-10 on pg-b: pg_ctl start timed out every 5 minutes, the
+# fail-count was cleared by failure-timeout, and nothing ever escalated).
+standby_start_failed_for_missing_wal() {
+    local snap="$1" startlog="$2" logdir f old size
+    local pattern='requested WAL segment [0-9A-Fa-f]+ has already been removed'
+    # stderr of the postmaster: the only log when logging_collector is off
+    # (truncated before every attempt, so it holds this attempt only)
+    if [ -s "$startlog" ] && grep -Eq "$pattern" "$startlog"; then
+        return 0
+    fi
+    logdir=$(get_pg_log_directory)
+    [ -n "$logdir" ] && [ -d "$logdir" ] || return 1
+    for f in "$logdir"/*; do
+        [ -f "$f" ] || continue
+        old=$(awk -v f="$f" '{ if (substr($0, index($0, " ") + 1) == f) { print $1; exit } }' "$snap")
+        size=$(stat -c %s "$f")
+        if [ -z "$old" ]; then
+            old=0                       # file created by this attempt
+        elif [ "$size" -le "$old" ]; then
+            continue                    # nothing new written
+        fi
+        if tail -c +$((old + 1)) "$f" | grep -Eq "$pattern"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 pgsql_start() {
     local rc
 
@@ -2436,13 +2493,49 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
     fi
 
     # Start PostgreSQL
-    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -w -t 60 start" >/dev/null 2>&1
+    local log_snapshot="${state_dir}/.pgtwin_start_logsnap"
+    local start_log="${state_dir}/.pgtwin_start.log"
+    snapshot_pg_logs "$log_snapshot"
+    : > "$start_log"
+    chown "${OCF_RESKEY_pguser}" "$start_log" 2>/dev/null
+    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -l ${start_log} -w -t 60 start" >/dev/null 2>&1
     rc=$?
 
     if [ $rc -ne 0 ]; then
+        # A standby whose required WAL no longer exists on the primary
+        # hangs in "waiting for WAL" until pg_ctl times out. Retrying the
+        # same start never helps (the segment is gone), and neither the
+        # timeline check nor pg_rewind notice it when both nodes are on the
+        # same timeline. Fall back to a full base backup instead of failing
+        # forever.
+        if [ -f "${PGDATA}/standby.signal" ] && standby_start_failed_for_missing_wal "$log_snapshot" "$start_log"; then
+            rm -f "$log_snapshot"
+            ocf_log warn "Standby cannot start: WAL required for recovery has already been removed on the primary"
+            ocf_log warn "Falling back to a full pg_basebackup"
+            if pgsql_is_running; then
+                pgsql_stop
+            fi
+            local bb_primary
+            bb_primary=$(discover_promoted_node)
+            if [ -z "$bb_primary" ]; then
+                ocf_log err "Cannot rebuild standby: unable to discover primary node"
+                return $OCF_ERR_GENERIC
+            fi
+            set_promotion_eligibility "ineligible"
+            recover_standby "${bb_primary}" basebackup-only
+            local bb_rc=$?
+            if [ $bb_rc -ne 0 ]; then
+                ocf_log err "Standby rebuild via pg_basebackup failed to start"
+                return $OCF_ERR_GENERIC
+            fi
+            ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
+            return $OCF_NOT_RUNNING
+        fi
+        rm -f "$log_snapshot"
         ocf_log err "Failed to start PostgreSQL"
         return $OCF_ERR_GENERIC
     fi
+    rm -f "$log_snapshot"
 
     # Wait for PostgreSQL to be ready
     local count=0
@@ -3083,6 +3176,7 @@ EOF
 
 recover_standby() {
     local primary_host="$1"
+    local mode="$2"        # "basebackup-only": skip pg_rewind (WAL already gone)
     local rc
     local rep_user
     local app_name
@@ -3099,8 +3193,10 @@ recover_standby() {
         pgsql_stop
     fi
 
-    # Try pg_rewind first
-    if [ -x "${PG_REWIND}" ]; then
+    # Try pg_rewind first (unless the caller knows it cannot help)
+    if [ "$mode" = "basebackup-only" ]; then
+        ocf_log info "Skipping pg_rewind, going straight to full basebackup"
+    elif [ -x "${PG_REWIND}" ]; then
         ocf_log info "Attempting pg_rewind"
 
         # Ensure .pgpass is in standard location
