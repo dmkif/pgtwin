@@ -11,6 +11,10 @@
   - The timeline check did not help: with equal timelines it does not run, and after a timeline divergence `pg_rewind` can answer `no rewind required` while the redo segment is still missing
   - Fix: if the start of a standby fails and the log lines written by that attempt contain `requested WAL segment ... has already been removed`, stop PostgreSQL and rebuild the standby with `pg_basebackup` (skipping `pg_rewind`), then defer to the monitor like the existing empty-PGDATA path. Only log lines written by the failed attempt are considered, with or without `logging_collector`
   - Reproduction: `test/wal-removed-repro/`
+- **Standby start did not ensure its replication slot exists on the primary**
+  - `finalize_standby_config()` writes `primary_slot_name`, but only the `pg_basebackup` path created the slot. After a `pg_rewind` recovery, a dropped slot or a rebuilt primary the walreceiver failed forever with `replication slot "..." does not exist`; the standby is consistent, so the start succeeded and nothing noticed that replication was down
+  - Fix: before a standby starts, the agent checks the slot on the primary and creates it with `immediately_reserve` if it is missing. Best effort: if the primary cannot be reached the start continues as before
+  - Reproduction: `test/wal-removed-repro/mkstandby-stream.sh`
 
 ---
 

@@ -21,4 +21,4 @@ podman exec pgp psql -U postgres -Atc "select pg_promote(true, 30)"
 podman exec pgp psql -U postgres -Atc "select timeline_id from pg_control_checkpoint()"
 # the primary has the slot, but it was created after the WAL was recycled (restart_lsn is newer than what the
 # standby needs), so the error is "WAL segment has already been removed", not "slot does not exist"
-podman exec pgp psql -U postgres -qc "SELECT pg_create_physical_replication_slot('ha_slot', true)" >/dev/null
+[ -n "${NO_SLOT:-}" ] || podman exec pgp psql -U postgres -qc "SELECT pg_create_physical_replication_slot('ha_slot', true)" >/dev/null

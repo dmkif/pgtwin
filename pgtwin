@@ -2103,6 +2103,33 @@ validate_pg_version() {
     return 0
 }
 
+# Make sure the replication slot named in primary_slot_name exists on the
+# primary before a standby starts. The standby configuration written by
+# finalize_standby_config() (after pg_rewind, or by an older basebackup)
+# names the slot, but only the pg_basebackup path ever created it. Without
+# the slot the walreceiver fails with 'replication slot "..." does not exist'
+# and the start/retry loop never ends; the slot can also be gone because it
+# was dropped by check_replication_slots() or the primary was rebuilt.
+# Best effort: a failure is logged and the start continues as before.
+ensure_primary_replication_slot() {
+    local primary_host="$1" rep_user="$2" result
+
+    [ -n "${OCF_RESKEY_slot_name}" ] || return 0
+    [ -n "$primary_host" ] && [ -n "$rep_user" ] || return 1
+
+    # immediately_reserve: the slot has to protect WAL from the moment it exists
+    local slot_sql="SELECT CASE WHEN (SELECT count(*) FROM pg_replication_slots WHERE slot_name = '${OCF_RESKEY_slot_name}') = 0 THEN (SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}', true))::text ELSE 'already_exists' END"
+    result=$(run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" 2>&1)
+    if [ $? -ne 0 ]; then
+        ocf_log warn "Could not check replication slot '${OCF_RESKEY_slot_name}' on primary ${primary_host}: ${result}"
+        return 1
+    fi
+    if [ "$result" != "already_exists" ]; then
+        ocf_log warn "Replication slot '${OCF_RESKEY_slot_name}' was missing on primary ${primary_host}, created it (WAL reserved)"
+    fi
+    return 0
+}
+
 # Resolve the directory PostgreSQL writes its server log files to.
 # Prints nothing if the log goes to stderr/syslog only (no log directory).
 get_pg_log_directory() {
@@ -2409,6 +2436,12 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
             else
                 ocf_log debug "No other cluster node available for timeline comparison"
             fi
+        fi
+
+        # The standby configuration names a replication slot; make sure the
+        # primary has it, otherwise the walreceiver fails forever.
+        if [ -n "${OCF_RESKEY_slot_name}" ]; then
+            ensure_primary_replication_slot "$(discover_promoted_node)" "$(get_replication_user)"
         fi
 
         # Safety check: Verify standby configuration before starting

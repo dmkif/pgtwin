@@ -27,6 +27,19 @@ the start still fails, because the standby's redo segment is gone but its checkp
 `./runra.sh <path-to-pgtwin> unit` runs the unit tests of the log scan (an old error line in the log must
 not trigger a rebuild).
 
+## Standby names a replication slot that does not exist on the primary
+
+`finalize_standby_config()` writes `primary_slot_name`, but only the `pg_basebackup` path created the slot.
+After `pg_rewind`, after the slot was dropped, or on a rebuilt primary the walreceiver then fails with
+`replication slot "ha_slot" does not exist`. The standby is consistent, so `pg_ctl start` succeeds and the
+agent reports success while nothing replicates.
+
+    ./setup.sh && ./mkstandby-stream.sh                   # consistent standby, no slot on the primary
+    ./runra.sh <path-to-pgtwin> start                     # before: RC=0 but pg_stat_replication is empty
+                                                          # after: slot created, standby streams
+    # same through the pg_rewind path:
+    ./setup.sh && ./mkstandby-stream.sh && NO_SLOT=1 ./mktimeline.sh && ./runra.sh <path-to-pgtwin> start
+
 ## Slot reservation (`slotcheck.sh`)
 
 `create_replication_slot()` runs when a node is promoted. Replication slots are not copied to the standby,
