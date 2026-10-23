@@ -1,3 +1,18 @@
+## [1.7.11] - 2026-10-23
+
+### Fixed
+- **Stale standby was promoted after a staggered shutdown of both nodes**
+  - `check_promotion_safety()` took the fail-open branch ("Allowing promotion") when no primary was running, even
+    though the peer was a cluster member. The node that booted first (the former standby) was promoted as soon as
+    the former primary joined the cluster, and the newer data of the former primary was discarded.
+  - Fix: `promotion_data_state_guard()` compares (timeline, replay LSN) with the peer before the existing checks;
+    the node that is ahead is promoted, the other refuses; equal states are decided by cluster name; a peer that
+    gives no usable state within the new parameter `promotion_peer_wait` (default 60 s, hard limit 100 s) is
+    treated as unreachable and the node is promoted with a warning. `force_promotion=true` and
+    `promotion_peer_wait=0` keep the old behaviour.
+  - Log: `promotion-by-data-state: decision=...` with both data states.
+  - Tests: `test/test-promotion-data-state.sh`; see `doc/FEATURE_PROMOTION_BY_DATA_STATE.md`.
+
 ## [1.7.10] - 2026-10-11
 
 ### Fixed
