@@ -10,6 +10,11 @@
     gives no usable state within the new parameter `promotion_peer_wait` (default 60 s, hard limit 100 s) is
     treated as unreachable and the node is promoted with a warning. `force_promotion=true` and
     `promotion_peer_wait=0` keep the old behaviour.
+  - A peer that is shutting down or in standby is not waited for (`promote-peer-leaving`), so a clean reboot of the
+    primary does not delay the failover.
+  - A former primary (no `standby.signal`) that starts while the peer is a cluster member and no primary runs is
+    started as standby, so the same comparison applies (primary dies, standby promoted and writing, new primary
+    dies, old primary boots first: 116 acknowledged commits lost before the fix).
   - Log: `promotion-by-data-state: decision=...` with both data states.
   - Tests: `test/test-promotion-data-state.sh`; see `doc/FEATURE_PROMOTION_BY_DATA_STATE.md`.
 

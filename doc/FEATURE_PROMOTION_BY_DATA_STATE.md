@@ -21,6 +21,11 @@ peer's before the existing sync/async checks:
 - the peer gives no usable state within `promotion_peer_wait` seconds (not reachable, PostgreSQL not running):
   the node is promoted anyway with a warning (availability over a dead peer); while the peer's position still
   advances the wait is extended up to 100 seconds, which stays below the 120 s promote timeout,
+- the peer is leaving in an orderly way (Pacemaker `shutdown` attribute set, or node in standby): no usable state will
+  come, the node is promoted at once (`promote-peer-leaving`); a clean shutdown flushes all WAL to the standby first,
+- a node without `standby.signal` (former primary) that starts while the peer is a cluster member and no primary is
+  running is started as standby, so that the same comparison decides who becomes primary (covers: primary dies, standby
+  is promoted and writes, new primary dies, old primary boots first),
 - peer is not a cluster member: unchanged (single-node guard, then the existing checks).
 
 A refusal returns an error from the promote action; Pacemaker then promotes the node that is ahead.
@@ -37,7 +42,7 @@ A refusal returns an error from the promote action; Pacemaker then promotes the 
 One line per decision:
 
 ```
-promotion-by-data-state: decision=<promote|refuse|promote-peer-unreachable> local=<tli>/<lsn> peer=<tli>/<lsn|unknown> tiebreak=<yes|no> waited=<s>s
+promotion-by-data-state: decision=<promote|refuse|promote-peer-unreachable|promote-peer-leaving> local=<tli>/<lsn> peer=<tli>/<lsn|unknown> tiebreak=<yes|no> waited=<s>s
 ```
 
 Find it with `journalctl -g 'decision=(promote|refuse)'`.

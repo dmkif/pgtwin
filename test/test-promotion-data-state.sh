@@ -66,4 +66,6 @@ grep -q 'promotion_data_state_guard || return 1' "$AGENT" && check "guard is wir
 
 grep -q "start_as_standby_for_data_comparison; then" "$AGENT" && check "former primary start is wired to the comparison" yes yes
 
+grep -q "peer_is_leaving \"\$peer\"" "$AGENT" && check "leaving peer is not waited for" yes yes
+
 if [ $fail -eq 0 ]; then echo "All tests passed"; exit 0; else echo "$fail test(s) failed"; exit 1; fi

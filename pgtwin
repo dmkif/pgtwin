@@ -2778,6 +2778,20 @@ get_peer_member_name() {
     crm_node -l 2>/dev/null | awk -v me="$me" '$3 == "member" && $2 != me { print $2; exit }'
 }
 
+# True if the peer is leaving the cluster in an orderly way (Pacemaker shutdown
+# in progress or standby): it will not provide a data state any more, so the
+# comparison must not wait for it. A clean shutdown flushes all WAL to the
+# standby first, so the node that stays has everything that was acknowledged.
+peer_is_leaving() {
+    local peer="$1" sd sb
+    command -v crm_attribute >/dev/null 2>&1 || return 1
+    sd=$(crm_attribute -N "$peer" -n shutdown -G -l reboot -q 2>/dev/null)
+    case "$sd" in ""|0) ;; *[!0-9]*) ;; *) return 0 ;; esac
+    sb=$(crm_attribute -N "$peer" -n standby -G -q 2>/dev/null)
+    case "$sb" in on|true|yes|1) return 0 ;; esac
+    return 1
+}
+
 # Print "<timeline> <lsn>" of a node (empty host = local socket).
 # The LSN is the replay position of a standby or the current position of a
 # primary. Returns 1 if the node does not answer or the answer is not valid.
@@ -2871,15 +2885,20 @@ promotion_data_state_guard() {
         decision=$(promotion_decision "$l_tli" "$l_lsn" "$p_tli" "$p_lsn" "$local_name" "$peer" "$waited" "$limit")
         case "$decision" in
             wait)
+                if [ "$p_tli" = "unknown" ] && peer_is_leaving "$peer"; then
+                    ocf_log warn "promotion-by-data-state: decision=promote-peer-leaving local=${l_tli}/${l_lsn} peer=unknown tiebreak=no waited=${waited}s"
+                    ocf_log warn "Peer ${peer} is shutting down or in standby; promoting this node without waiting"
+                    return 0
+                fi
                 sleep 3
                 continue
                 ;;
             promote)
-                ocf_log info "promotion-by-data-state: decision=promote local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_lsn" = "$l_lsn" ] && echo yes || echo no) waited=${waited}s"
+                ocf_log info "promotion-by-data-state: decision=promote local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_tli/$p_lsn" = "$l_tli/$l_lsn" ] && echo yes || echo no) waited=${waited}s"
                 return 0
                 ;;
             refuse)
-                ocf_log warn "promotion-by-data-state: decision=refuse local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_lsn" = "$l_lsn" ] && echo yes || echo no) waited=${waited}s"
+                ocf_log warn "promotion-by-data-state: decision=refuse local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_tli/$p_lsn" = "$l_tli/$l_lsn" ] && echo yes || echo no) waited=${waited}s"
                 ocf_log warn "Peer ${peer} has the newer (or preferred equal) data state, not promoting this node"
                 return 1
                 ;;
