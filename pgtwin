@@ -2352,6 +2352,17 @@ pgsql_start() {
         fi
     fi
 
+    # Data-state comparison also for a former primary: without standby.signal the
+    # node would start as primary directly and could win against a peer that was
+    # promoted in the meantime (primary dies, standby is promoted and keeps writing,
+    # then the new primary dies too and the OLD primary boots first). If the peer is
+    # a cluster member and no primary is running, start as standby; the promotion
+    # then compares timeline and LSN with the peer (promotion_data_state_guard).
+    if [ ! -f "${PGDATA}/standby.signal" ] && [ -f "${PGDATA}/PG_VERSION" ] && start_as_standby_for_data_comparison; then
+        ocf_log warn "promotion-by-data-state: peer is a cluster member and no primary is running; starting as standby so that the promotion decision compares the data states"
+        run_as_pguser touch "${PGDATA}/standby.signal"
+    fi
+
     # Check if we need to do recovery
     if [ -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Starting PostgreSQL as standby"
@@ -2793,6 +2804,17 @@ query_stable_data_state() {
     echo "$second"
     [ "$first" = "$second" ] && return 0
     return 2
+}
+
+# True if a node without standby.signal should start as standby: the data-state
+# comparison is enabled, the peer is a cluster member and no primary is running.
+start_as_standby_for_data_comparison() {
+    local wait_max="${OCF_RESKEY_promotion_peer_wait:-60}"
+    case "$wait_max" in ""|*[!0-9]*) wait_max=60 ;; esac
+    [ "$wait_max" -gt 0 ] || return 1
+    [ -n "$(get_peer_member_name)" ] || return 1
+    [ -z "$(discover_promoted_node 2>/dev/null)" ] || return 1
+    return 0
 }
 
 # Promotion guard for a standby without a reachable primary: compare the data

@@ -64,4 +64,6 @@ grep -q 'force_promotion=true - BYPASSING ALL SAFETY CHECKS' "$AGENT" && \
     check "force_promotion check precedes the guard" yes yes
 grep -q 'promotion_data_state_guard || return 1' "$AGENT" && check "guard is wired into check_promotion_safety" yes yes
 
+grep -q "start_as_standby_for_data_comparison; then" "$AGENT" && check "former primary start is wired to the comparison" yes yes
+
 if [ $fail -eq 0 ]; then echo "All tests passed"; exit 0; else echo "$fail test(s) failed"; exit 1; fi
