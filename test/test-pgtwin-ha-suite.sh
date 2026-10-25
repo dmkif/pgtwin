@@ -17,18 +17,25 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Default configuration from QUICKSTART.md (bare-metal)
-NODE1="psql1"
-NODE2="psql2"
-NODE1_IP="192.168.122.60"
-NODE2_IP="192.168.122.120"
-PGPORT="5432"
-PGDATA="/var/lib/pgsql/data"
-REP_USER="replicator"
-REP_PASSWORD="PgTwin2025!Repl"  # Default test password
-SLOT_NAME="ha_slot"
-APPLICATION_NAME_NODE1="psql1"
-APPLICATION_NAME_NODE2="psql2"
+# Default configuration from QUICKSTART.md (bare-metal). Every value can be overridden
+# from the environment, e.g. for a lab with different host names:
+#   NODE1=pgt-a NODE2=pgt-b NODE1_IP=10.99.0.11 NODE2_IP=10.99.0.12 \
+#   APPLICATION_NAME_NODE1=pg_a APPLICATION_NAME_NODE2=pg_b ./test-pgtwin-ha-suite.sh 10.99.0.5
+# The suite logs in as ${SSH_USER} (default root) and expects that user to be able to run
+# crm and 'sudo -u postgres'. 'crm node standby/online <other node>' is run from NODE1, so
+# root on NODE1 needs SSH access to NODE2 (crmsh requirement).
+NODE1="${NODE1:-psql1}"
+NODE2="${NODE2:-psql2}"
+NODE1_IP="${NODE1_IP:-192.168.122.60}"
+NODE2_IP="${NODE2_IP:-192.168.122.120}"
+SSH_USER="${SSH_USER:-root}"
+PGPORT="${PGPORT:-5432}"
+PGDATA="${PGDATA:-/var/lib/pgsql/data}"
+REP_USER="${REP_USER:-replicator}"
+REP_PASSWORD="${REP_PASSWORD:-PgTwin2025!Repl}"  # Default test password
+SLOT_NAME="${SLOT_NAME:-ha_slot}"
+APPLICATION_NAME_NODE1="${APPLICATION_NAME_NODE1:-psql1}"
+APPLICATION_NAME_NODE2="${APPLICATION_NAME_NODE2:-psql2}"
 
 # VIP from command line
 if [ $# -ne 1 ]; then
@@ -77,6 +84,12 @@ print_header() {
     echo ""
 }
 
+# Expected application_name for a cluster node (the agent derives it from the node
+# name, so it can differ from the host name, e.g. pgt-a -> pg_a)
+app_name_for_node() {
+    if [ "$1" = "$NODE1" ]; then echo "$APPLICATION_NAME_NODE1"; else echo "$APPLICATION_NAME_NODE2"; fi
+}
+
 test_start() {
     local test_name="$1"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -97,11 +110,11 @@ gather_cluster_state() {
     log_debug "Gathering cluster state for test $test_num"
 
     # Cluster status from both nodes
-    ssh root@${NODE1} "crm status" > "${output_dir}/cluster_status_node1.txt" 2>&1 || echo "Failed to get cluster status from node1" > "${output_dir}/cluster_status_node1.txt"
-    ssh root@${NODE2} "crm status" > "${output_dir}/cluster_status_node2.txt" 2>&1 || echo "Failed to get cluster status from node2" > "${output_dir}/cluster_status_node2.txt"
+    ssh ${SSH_USER}@${NODE1} "crm status" > "${output_dir}/cluster_status_node1.txt" 2>&1 || echo "Failed to get cluster status from node1" > "${output_dir}/cluster_status_node1.txt"
+    ssh ${SSH_USER}@${NODE2} "crm status" > "${output_dir}/cluster_status_node2.txt" 2>&1 || echo "Failed to get cluster status from node2" > "${output_dir}/cluster_status_node2.txt"
 
     # Cluster configuration
-    ssh root@${NODE1} "crm configure show" > "${output_dir}/cluster_config.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "crm configure show" > "${output_dir}/cluster_config.txt" 2>&1 || true
 }
 
 gather_pacemaker_logs() {
@@ -111,12 +124,12 @@ gather_pacemaker_logs() {
     log_debug "Gathering Pacemaker logs for test $test_num"
 
     # Recent Pacemaker logs from both nodes (last 500 lines)
-    ssh root@${NODE1} "journalctl -u pacemaker --since '5 minutes ago' -n 500" > "${output_dir}/pacemaker_node1.log" 2>&1 || true
-    ssh root@${NODE2} "journalctl -u pacemaker --since '5 minutes ago' -n 500" > "${output_dir}/pacemaker_node2.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "journalctl -u pacemaker --since '5 minutes ago' -n 500" > "${output_dir}/pacemaker_node1.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "journalctl -u pacemaker --since '5 minutes ago' -n 500" > "${output_dir}/pacemaker_node2.log" 2>&1 || true
 
     # Filter for errors and warnings
-    ssh root@${NODE1} "journalctl -u pacemaker --since '5 minutes ago' | grep -iE '(error|warning|failed)'" > "${output_dir}/pacemaker_errors_node1.log" 2>&1 || true
-    ssh root@${NODE2} "journalctl -u pacemaker --since '5 minutes ago' | grep -iE '(error|warning|failed)'" > "${output_dir}/pacemaker_errors_node2.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "journalctl -u pacemaker --since '5 minutes ago' | grep -iE '(error|warning|failed)'" > "${output_dir}/pacemaker_errors_node1.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "journalctl -u pacemaker --since '5 minutes ago' | grep -iE '(error|warning|failed)'" > "${output_dir}/pacemaker_errors_node2.log" 2>&1 || true
 }
 
 gather_postgresql_logs() {
@@ -126,12 +139,12 @@ gather_postgresql_logs() {
     log_debug "Gathering PostgreSQL logs for test $test_num"
 
     # PostgreSQL logs from both nodes (last 200 lines)
-    ssh root@${NODE1} "tail -200 ${PGDATA}/log/postgresql-*.log 2>/dev/null" > "${output_dir}/postgresql_node1.log" 2>&1 || true
-    ssh root@${NODE2} "tail -200 ${PGDATA}/log/postgresql-*.log 2>/dev/null" > "${output_dir}/postgresql_node2.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "tail -200 ${PGDATA}/log/postgresql-*.log 2>/dev/null" > "${output_dir}/postgresql_node1.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "tail -200 ${PGDATA}/log/postgresql-*.log 2>/dev/null" > "${output_dir}/postgresql_node2.log" 2>&1 || true
 
     # PostgreSQL configuration
-    ssh root@${NODE1} "cat ${PGDATA}/postgresql.auto.conf 2>/dev/null" > "${output_dir}/postgresql_auto_conf_node1.txt" 2>&1 || true
-    ssh root@${NODE2} "cat ${PGDATA}/postgresql.auto.conf 2>/dev/null" > "${output_dir}/postgresql_auto_conf_node2.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "cat ${PGDATA}/postgresql.auto.conf 2>/dev/null" > "${output_dir}/postgresql_auto_conf_node1.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "cat ${PGDATA}/postgresql.auto.conf 2>/dev/null" > "${output_dir}/postgresql_auto_conf_node2.txt" 2>&1 || true
 }
 
 gather_replication_status() {
@@ -144,15 +157,15 @@ gather_replication_status() {
     local promoted=$(get_promoted_node)
     if [ -n "$promoted" ]; then
         # Replication status from promoted node
-        ssh root@${promoted} "sudo -u postgres psql -x -c 'SELECT * FROM pg_stat_replication;' 2>/dev/null" > "${output_dir}/pg_stat_replication.txt" 2>&1 || true
+        ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -x -c 'SELECT * FROM pg_stat_replication;' 2>/dev/null" > "${output_dir}/pg_stat_replication.txt" 2>&1 || true
 
         # Replication slots
-        ssh root@${promoted} "sudo -u postgres psql -x -c 'SELECT * FROM pg_replication_slots;' 2>/dev/null" > "${output_dir}/pg_replication_slots.txt" 2>&1 || true
+        ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -x -c 'SELECT * FROM pg_replication_slots;' 2>/dev/null" > "${output_dir}/pg_replication_slots.txt" 2>&1 || true
     fi
 
     # Recovery status from both nodes
-    ssh root@${NODE1} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" > "${output_dir}/recovery_status_node1.txt" 2>&1 || echo "unknown" > "${output_dir}/recovery_status_node1.txt"
-    ssh root@${NODE2} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" > "${output_dir}/recovery_status_node2.txt" 2>&1 || echo "unknown" > "${output_dir}/recovery_status_node2.txt"
+    ssh ${SSH_USER}@${NODE1} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" > "${output_dir}/recovery_status_node1.txt" 2>&1 || echo "unknown" > "${output_dir}/recovery_status_node1.txt"
+    ssh ${SSH_USER}@${NODE2} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" > "${output_dir}/recovery_status_node2.txt" 2>&1 || echo "unknown" > "${output_dir}/recovery_status_node2.txt"
 }
 
 gather_basebackup_logs() {
@@ -162,12 +175,12 @@ gather_basebackup_logs() {
     log_debug "Gathering basebackup logs for test $test_num"
 
     # Basebackup logs from both nodes
-    ssh root@${NODE1} "cat /var/lib/pgsql/.pgtwin_basebackup.log 2>/dev/null" > "${output_dir}/basebackup_node1.log" 2>&1 || true
-    ssh root@${NODE2} "cat /var/lib/pgsql/.pgtwin_basebackup.log 2>/dev/null" > "${output_dir}/basebackup_node2.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "cat /var/lib/pgsql/.pgtwin_basebackup.log 2>/dev/null" > "${output_dir}/basebackup_node1.log" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "cat /var/lib/pgsql/.pgtwin_basebackup.log 2>/dev/null" > "${output_dir}/basebackup_node2.log" 2>&1 || true
 
     # Basebackup state files
-    ssh root@${NODE1} "cat /var/lib/pgsql/.pgtwin_basebackup_in_progress 2>/dev/null" > "${output_dir}/basebackup_state_node1.txt" 2>&1 || true
-    ssh root@${NODE2} "cat /var/lib/pgsql/.pgtwin_basebackup_in_progress 2>/dev/null" > "${output_dir}/basebackup_state_node2.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "cat /var/lib/pgsql/.pgtwin_basebackup_in_progress 2>/dev/null" > "${output_dir}/basebackup_state_node1.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "cat /var/lib/pgsql/.pgtwin_basebackup_in_progress 2>/dev/null" > "${output_dir}/basebackup_state_node2.txt" 2>&1 || true
 }
 
 gather_file_ownership() {
@@ -177,12 +190,12 @@ gather_file_ownership() {
     log_debug "Gathering file ownership information for test $test_num"
 
     # PGDATA ownership
-    ssh root@${NODE1} "ls -ld ${PGDATA} 2>/dev/null" > "${output_dir}/pgdata_ownership_node1.txt" 2>&1 || true
-    ssh root@${NODE2} "ls -ld ${PGDATA} 2>/dev/null" > "${output_dir}/pgdata_ownership_node2.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "ls -ld ${PGDATA} 2>/dev/null" > "${output_dir}/pgdata_ownership_node1.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "ls -ld ${PGDATA} 2>/dev/null" > "${output_dir}/pgdata_ownership_node2.txt" 2>&1 || true
 
     # Files with wrong ownership
-    ssh root@${NODE1} "find ${PGDATA} -maxdepth 2 ! -user postgres 2>/dev/null" > "${output_dir}/wrong_ownership_node1.txt" 2>&1 || true
-    ssh root@${NODE2} "find ${PGDATA} -maxdepth 2 ! -user postgres 2>/dev/null" > "${output_dir}/wrong_ownership_node2.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE1} "find ${PGDATA} -maxdepth 2 ! -user postgres 2>/dev/null" > "${output_dir}/wrong_ownership_node1.txt" 2>&1 || true
+    ssh ${SSH_USER}@${NODE2} "find ${PGDATA} -maxdepth 2 ! -user postgres 2>/dev/null" > "${output_dir}/wrong_ownership_node2.txt" 2>&1 || true
 }
 
 gather_diagnostics() {
@@ -245,7 +258,7 @@ analyze_application_name_failure() {
     # Check what application_name is actually set
     local promoted=$(get_promoted_node)
     if [ -n "$promoted" ]; then
-        local actual_name=$(ssh root@${promoted} "sudo -u postgres psql -Atc 'SHOW application_name;' 2>/dev/null" || echo "unknown")
+        local actual_name=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc 'SHOW application_name;' 2>/dev/null" || echo "unknown")
         echo "Current application_name: $actual_name" >> "$analysis_file"
         echo "Expected: $promoted" >> "$analysis_file"
         echo "" >> "$analysis_file"
@@ -460,7 +473,7 @@ wait_for_cluster_stable() {
     log_debug "Waiting for cluster to stabilize..."
 
     while [ $count -lt $max_wait ]; do
-        if ssh root@${NODE1} "crm status 2>/dev/null" | grep -q "2 nodes configured"; then
+        if ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null" | grep -q "2 nodes configured"; then
             sleep 2
             log_debug "Cluster stable after $count seconds"
             return 0
@@ -474,7 +487,7 @@ wait_for_cluster_stable() {
 }
 
 get_promoted_node() {
-    local status=$(ssh root@${NODE1} "crm status 2>/dev/null")
+    local status=$(ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null")
     if echo "$status" | grep -q "Promoted.*${NODE1}"; then
         echo "$NODE1"
     elif echo "$status" | grep -q "Promoted.*${NODE2}"; then
@@ -517,7 +530,7 @@ test_slot_creation() {
         return
     fi
 
-    local slot_exists=$(ssh root@${promoted} "sudo -u postgres psql -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "0")
+    local slot_exists=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "0")
 
     if [ "$slot_exists" = "1" ]; then
         test_pass "Replication slot automatic creation"
@@ -535,11 +548,11 @@ test_slot_size_monitoring() {
         return
     fi
 
-    local slot_size=$(ssh root@${promoted} "sudo -u postgres psql -Atc \"SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "")
+    local slot_size=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc \"SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "")
 
     if [ -n "$slot_size" ]; then
         log_debug "Slot size: $slot_size"
-        local monitor_log=$(ssh root@${promoted} "journalctl -u pacemaker --since '5 minutes ago' 2>/dev/null | grep -i 'slot' | tail -5" || echo "")
+        local monitor_log=$(ssh ${SSH_USER}@${promoted} "journalctl -u pacemaker --since '5 minutes ago' 2>/dev/null | grep -i 'slot' | tail -5" || echo "")
         log_debug "Recent slot monitoring: $monitor_log"
         test_pass "Replication slot size monitoring"
     else
@@ -551,23 +564,23 @@ test_automatic_standby_init() {
     test_start "Automatic standby initialization (empty PGDATA)"
 
     log_debug "Putting ${NODE2} in standby mode"
-    ssh root@${NODE1} "crm node standby ${NODE2}" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node standby ${NODE2}" 2>&1 | tee -a "$LOG_FILE"
     sleep 3
 
     log_debug "Deleting PGDATA on ${NODE2}"
-    ssh root@${NODE2} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE2} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
 
     log_debug "Bringing ${NODE2} online"
-    ssh root@${NODE1} "crm node online ${NODE2}" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node online ${NODE2}" 2>&1 | tee -a "$LOG_FILE"
 
     local max_wait=300
     local count=0
     local initialized=false
 
     while [ $count -lt $max_wait ]; do
-        local status=$(ssh root@${NODE1} "crm status 2>/dev/null")
+        local status=$(ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null")
         if echo "$status" | grep -q "Unpromoted.*${NODE2}"; then
-            local in_recovery=$(ssh root@${NODE2} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" || echo "")
+            local in_recovery=$(ssh ${SSH_USER}@${NODE2} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" || echo "")
             if [ "$in_recovery" = "t" ]; then
                 initialized=true
                 log_debug "Automatic initialization completed after $count seconds"
@@ -596,12 +609,15 @@ test_postgres_auto_settings() {
 
     # Check if application_name is set correctly in postgresql.auto.conf (server setting)
     # Note: We check the server configuration, not psql client (which overrides with 'psql')
-    local app_name=$(ssh root@${promoted} "grep '^application_name' ${PGDATA}/postgresql.auto.conf 2>/dev/null | cut -d= -f2 | tr -d \" ' ')" || echo "")
+    local expected_app_name
+    expected_app_name=$(app_name_for_node "$promoted")
+    local app_name
+    app_name=$(ssh ${SSH_USER}@${promoted} "grep '^application_name' ${PGDATA}/postgresql.auto.conf 2>/dev/null | cut -d= -f2 | tr -d \"' \"" || echo "")
 
-    if [ "$app_name" = "$promoted" ]; then
+    if [ "$app_name" = "$expected_app_name" ]; then
         test_pass "Automatic PostgreSQL variable settings"
     else
-        test_fail "Automatic PostgreSQL variable settings" "Expected application_name='$promoted', got '$app_name'"
+        test_fail "Automatic PostgreSQL variable settings" "Expected application_name='$expected_app_name', got '$app_name'"
     fi
 }
 
@@ -614,7 +630,7 @@ test_prevent_restart_after_crash() {
         return
     fi
 
-    local restart_setting=$(ssh root@${promoted} "sudo -u postgres psql -Atc 'SHOW restart_after_crash;' 2>/dev/null" || echo "")
+    local restart_setting=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc 'SHOW restart_after_crash;' 2>/dev/null" || echo "")
 
     if [ "$restart_setting" = "off" ]; then
         test_pass "Prevent misconfiguration: restart_after_crash"
@@ -632,13 +648,14 @@ test_prevent_invalid_wal_sender_timeout() {
         return
     fi
 
-    local timeout=$(ssh root@${promoted} "sudo -u postgres psql -Atc 'SHOW wal_sender_timeout;' 2>/dev/null" || echo "0")
-    local timeout_ms=$(echo "$timeout" | sed 's/ms//' | sed 's/s/000/')
+    # pg_settings reports milliseconds regardless of how the value is displayed (60s, 1min, ...)
+    local timeout_ms
+    timeout_ms=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc \"SELECT setting FROM pg_settings WHERE name='wal_sender_timeout';\" 2>/dev/null" || echo "0")
 
-    if [ "$timeout_ms" -ge 10000 ]; then
+    if [ "$timeout_ms" -ge 10000 ] 2>/dev/null; then
         test_pass "Prevent misconfiguration: wal_sender_timeout"
     else
-        test_fail "Prevent misconfiguration: wal_sender_timeout" "wal_sender_timeout is ${timeout}, should be >= 10s"
+        test_fail "Prevent misconfiguration: wal_sender_timeout" "wal_sender_timeout is ${timeout_ms} ms, should be >= 10000 ms"
     fi
 }
 
@@ -656,26 +673,26 @@ test_migration_with_rewind() {
     fi
 
     log_debug "Failing over to $target_node"
-    ssh root@${NODE1} "crm node standby $original_primary" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node standby $original_primary" 2>&1 | tee -a "$LOG_FILE"
 
     if ! wait_for_promotion "$target_node"; then
         test_fail "Migration with pg_rewind" "Failover to $target_node failed"
-        ssh root@${NODE1} "crm node online $original_primary" 2>&1 | tee -a "$LOG_FILE"
+        ssh ${SSH_USER}@${NODE1} "crm node online $original_primary" 2>&1 | tee -a "$LOG_FILE"
         return
     fi
 
     log_debug "Creating timeline divergence"
-    ssh root@${target_node} "sudo -u postgres psql -c 'CREATE TABLE IF NOT EXISTS test_divergence_$(date +%s) (id int);' 2>&1" | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${target_node} "sudo -u postgres psql -c 'CREATE TABLE IF NOT EXISTS test_divergence_$(date +%s) (id int);' 2>&1" | tee -a "$LOG_FILE"
     sleep 2
 
     log_debug "Bringing $original_primary back online (should use pg_rewind)"
-    ssh root@${NODE1} "crm node online $original_primary" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node online $original_primary" 2>&1 | tee -a "$LOG_FILE"
 
     # Wait for it to join as standby (pg_rewind or basebackup fallback may take time)
     sleep 30
-    local status=$(ssh root@${NODE1} "crm status 2>/dev/null")
+    local status=$(ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null")
 
-    local rewind_log=$(ssh root@${original_primary} "journalctl -u pacemaker --since '1 minute ago' 2>/dev/null | grep -i 'rewind'" || echo "")
+    local rewind_log=$(ssh ${SSH_USER}@${original_primary} "journalctl -u pacemaker --since '1 minute ago' 2>/dev/null | grep -i 'rewind'" || echo "")
     log_debug "pg_rewind log: $rewind_log"
 
     if echo "$status" | grep -q "Unpromoted.*${original_primary}"; then
@@ -685,9 +702,9 @@ test_migration_with_rewind() {
     fi
 
     log_debug "Failing back to $original_primary"
-    ssh root@${NODE1} "crm node standby $target_node" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node standby $target_node" 2>&1 | tee -a "$LOG_FILE"
     wait_for_promotion "$original_primary"
-    ssh root@${NODE1} "crm node online $target_node" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node online $target_node" 2>&1 | tee -a "$LOG_FILE"
     sleep 5
 }
 
@@ -706,22 +723,22 @@ test_migration_with_basebackup_with_slot() {
     log_debug "Promoted: $promoted, Standby: $standby_node"
 
     log_debug "Forcing basebackup by deleting PGDATA on $standby_node"
-    ssh root@${NODE1} "crm node standby $standby_node" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node standby $standby_node" 2>&1 | tee -a "$LOG_FILE"
     sleep 3
 
-    ssh root@${standby_node} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${standby_node} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
 
     log_debug "Bringing $standby_node online (should use pg_basebackup with slot)"
-    ssh root@${NODE1} "crm node online $standby_node" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node online $standby_node" 2>&1 | tee -a "$LOG_FILE"
 
     local max_wait=300
     local count=0
     local completed=false
 
     while [ $count -lt $max_wait ]; do
-        local status=$(ssh root@${NODE1} "crm status 2>/dev/null")
+        local status=$(ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null")
         if echo "$status" | grep -q "Unpromoted.*${standby_node}"; then
-            local in_recovery=$(ssh root@${standby_node} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" || echo "")
+            local in_recovery=$(ssh ${SSH_USER}@${standby_node} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" || echo "")
             if [ "$in_recovery" = "t" ]; then
                 completed=true
                 log_debug "Basebackup with slot completed after $count seconds"
@@ -734,11 +751,11 @@ test_migration_with_basebackup_with_slot() {
 
     if [ "$completed" = true ]; then
         # Verify slot was used - check Pacemaker logs for slot creation/usage
-        local slot_log=$(ssh root@${standby_node} "journalctl -u pacemaker --since '5 minutes ago' 2>/dev/null | grep -E 'Replication slot.*${SLOT_NAME}'" || echo "")
+        local slot_log=$(ssh ${SSH_USER}@${standby_node} "journalctl -u pacemaker --since '5 minutes ago' 2>/dev/null | grep -E 'Replication slot.*${SLOT_NAME}'" || echo "")
         log_debug "Slot usage log: $slot_log"
 
         # Also verify slot exists and is active
-        local slot_active=$(ssh root@${promoted} "sudo -u postgres psql -Atc \"SELECT active FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "")
+        local slot_active=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc \"SELECT active FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "")
 
         if [ -n "$slot_log" ] || [ "$slot_active" = "t" ]; then
             test_pass "Migration with pg_basebackup (with slot)"
@@ -761,7 +778,7 @@ test_sync_mode_after_migration() {
 
     sleep 5
 
-    local sync_state=$(ssh root@${promoted} "sudo -u postgres psql -Atc \"SELECT sync_state FROM pg_stat_replication WHERE application_name='${NODE1}' OR application_name='${NODE2}' LIMIT 1;\" 2>/dev/null" || echo "")
+    local sync_state=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc \"SELECT sync_state FROM pg_stat_replication WHERE application_name='${APPLICATION_NAME_NODE1}' OR application_name='${APPLICATION_NAME_NODE2}' LIMIT 1;\" 2>/dev/null" || echo "")
 
     log_debug "Sync state: '$sync_state'"
 
@@ -780,22 +797,22 @@ test_file_ownership() {
     for node in $NODE1 $NODE2; do
         log_debug "Checking file ownership on $node"
 
-        local pgdata_owner=$(ssh root@${node} "stat -c '%U:%G' ${PGDATA} 2>/dev/null" || echo "")
+        local pgdata_owner=$(ssh ${SSH_USER}@${node} "stat -c '%U:%G' ${PGDATA} 2>/dev/null" || echo "")
         if [ "$pgdata_owner" != "postgres:postgres" ]; then
             issues="${issues}${node}: PGDATA owned by '${pgdata_owner}' (expected postgres:postgres)\n"
         fi
 
-        local wrong_files=$(ssh root@${node} "find ${PGDATA} -maxdepth 2 ! -user postgres 2>/dev/null | wc -l" || echo "999")
+        local wrong_files=$(ssh ${SSH_USER}@${node} "find ${PGDATA} -maxdepth 2 ! -user postgres 2>/dev/null | wc -l" || echo "999")
         if [ "$wrong_files" -gt 0 ]; then
             issues="${issues}${node}: Found ${wrong_files} files not owned by postgres\n"
         fi
 
-        local pgpass_owner=$(ssh root@${node} "stat -c '%U:%G' /var/lib/pgsql/.pgpass 2>/dev/null" || echo "")
+        local pgpass_owner=$(ssh ${SSH_USER}@${node} "stat -c '%U:%G' /var/lib/pgsql/.pgpass 2>/dev/null" || echo "")
         if [ "$pgpass_owner" != "postgres:postgres" ]; then
             issues="${issues}${node}: .pgpass owned by '${pgpass_owner}' (expected postgres:postgres)\n"
         fi
 
-        local pgpass_perms=$(ssh root@${node} "stat -c '%a' /var/lib/pgsql/.pgpass 2>/dev/null" || echo "")
+        local pgpass_perms=$(ssh ${SSH_USER}@${node} "stat -c '%a' /var/lib/pgsql/.pgpass 2>/dev/null" || echo "")
         if [ "$pgpass_perms" != "600" ]; then
             issues="${issues}${node}: .pgpass has permissions '${pgpass_perms}' (expected 600)\n"
         fi
@@ -823,29 +840,29 @@ test_slot_missing_during_basebackup() {
     log_debug "Testing slot recreation: Promoted=$promoted, Standby=$standby_node"
 
     log_debug "Deleting replication slot on $promoted"
-    ssh root@${promoted} "sudo -u postgres psql -c \"SELECT pg_drop_replication_slot('${SLOT_NAME}');\" 2>&1" | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -c \"SELECT pg_drop_replication_slot('${SLOT_NAME}');\" 2>&1" | tee -a "$LOG_FILE"
 
     log_debug "Forcing standby re-initialization"
-    ssh root@${NODE1} "crm node standby $standby_node" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node standby $standby_node" 2>&1 | tee -a "$LOG_FILE"
     sleep 3
 
-    ssh root@${standby_node} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${standby_node} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
 
-    ssh root@${NODE1} "crm node online $standby_node" 2>&1 | tee -a "$LOG_FILE"
+    ssh ${SSH_USER}@${NODE1} "crm node online $standby_node" 2>&1 | tee -a "$LOG_FILE"
 
     local max_wait=300
     local count=0
     local slot_created=false
 
     while [ $count -lt $max_wait ]; do
-        local slot_exists=$(ssh root@${promoted} "sudo -u postgres psql -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "0")
+        local slot_exists=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${SLOT_NAME}';\" 2>/dev/null" || echo "0")
 
         if [ "$slot_exists" = "1" ]; then
             slot_created=true
             log_debug "Slot recreated after $count seconds"
 
             sleep 10
-            local status=$(ssh root@${NODE1} "crm status 2>/dev/null")
+            local status=$(ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null")
             if echo "$status" | grep -q "Unpromoted.*${standby_node}"; then
                 break
             fi
@@ -871,11 +888,11 @@ test_version_validation() {
         return
     fi
 
-    local version_check=$(ssh root@${promoted} "journalctl -u pacemaker --since '10 minutes ago' 2>/dev/null | grep -i 'version' | grep -i 'validation\|mismatch'" || echo "")
+    local version_check=$(ssh ${SSH_USER}@${promoted} "journalctl -u pacemaker --since '10 minutes ago' 2>/dev/null | grep -i 'version' | grep -i 'validation\|mismatch'" || echo "")
 
     log_debug "Version check log: $version_check"
 
-    local pg_version=$(ssh root@${promoted} "sudo -u postgres psql -Atc 'SELECT version();' 2>/dev/null" || echo "")
+    local pg_version=$(ssh ${SSH_USER}@${promoted} "sudo -u postgres psql -Atc 'SELECT version();' 2>/dev/null" || echo "")
 
     if [ -n "$pg_version" ]; then
         test_pass "PostgreSQL version validation"
@@ -914,7 +931,7 @@ EOF
 
 # Check cluster is accessible
 log "Checking cluster accessibility..."
-if ! ssh root@${NODE1} "crm status >/dev/null 2>&1"; then
+if ! ssh ${SSH_USER}@${NODE1} "crm status >/dev/null 2>&1"; then
     echo "ERROR: Cannot access cluster on $NODE1"
     exit 1
 fi
