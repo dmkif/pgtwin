@@ -1,4 +1,4 @@
-## [1.7.11] - 2026-10-23
+## [1.7.11] - 2026-10-25
 
 ### Fixed
 - **Stale standby was promoted after a staggered shutdown of both nodes**
