@@ -89,6 +89,7 @@ OCF_RESKEY_backup_before_basebackup_default="true"
 OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
+OCF_RESKEY_promotion_peer_wait_default="60"
 OCF_RESKEY_vip_default=""
 OCF_RESKEY_container_mode_default="false"
 OCF_RESKEY_pg_major_version_default=""
@@ -110,6 +111,7 @@ OCF_RESKEY_container_image_default="registry.opensuse.org/devel/bci/tumbleweed/c
 : ${OCF_RESKEY_basebackup_timeout=${OCF_RESKEY_basebackup_timeout_default}}
 : ${OCF_RESKEY_pgpassfile=${OCF_RESKEY_pgpassfile_default}}
 : ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
+: ${OCF_RESKEY_promotion_peer_wait=${OCF_RESKEY_promotion_peer_wait_default}}
 : ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
 : ${OCF_RESKEY_container_mode=${OCF_RESKEY_container_mode_default}}
 : ${OCF_RESKEY_pg_major_version=${OCF_RESKEY_pg_major_version_default}}
@@ -410,6 +412,28 @@ Default: 10485760 (10 MB)
 </longdesc>
 <shortdesc lang="en">Max promotion lag (bytes)</shortdesc>
 <content type="integer" default="${OCF_RESKEY_max_promotion_lag_bytes_default}" />
+</parameter>
+
+<parameter name="promotion_peer_wait" unique="0">
+<longdesc lang="en">
+Seconds to wait, before promoting a standby without a reachable primary,
+for a usable data state of the peer node when the peer is a member of the
+cluster. Before the promotion the standby compares its own timeline and
+WAL replay position with the peer's and refuses to promote if the peer is
+ahead, so that a stale node cannot win after a staggered shutdown of both
+nodes. If the peer does not answer within this time the standby is
+promoted anyway (availability) and a warning with both known states is
+logged. While the peer's position still advances (crash recovery) the wait
+is extended up to a fixed limit of 100 seconds, which stays below the
+default promote timeout of 120 seconds.
+
+0 disables the comparison (previous behaviour). force_promotion=true
+bypasses it as well.
+
+Default: 60
+</longdesc>
+<shortdesc lang="en">Wait for the peer's data state before promotion (s)</shortdesc>
+<content type="integer" default="${OCF_RESKEY_promotion_peer_wait_default}" />
 </parameter>
 
 <parameter name="force_promotion" unique="0">
@@ -2328,6 +2352,17 @@ pgsql_start() {
         fi
     fi
 
+    # Data-state comparison also for a former primary: without standby.signal the
+    # node would start as primary directly and could win against a peer that was
+    # promoted in the meantime (primary dies, standby is promoted and keeps writing,
+    # then the new primary dies too and the OLD primary boots first). If the peer is
+    # a cluster member and no primary is running, start as standby; the promotion
+    # then compares timeline and LSN with the peer (promotion_data_state_guard).
+    if [ ! -f "${PGDATA}/standby.signal" ] && [ -f "${PGDATA}/PG_VERSION" ] && start_as_standby_for_data_comparison; then
+        ocf_log warn "promotion-by-data-state: peer is a cluster member and no primary is running; starting as standby so that the promotion decision compares the data states"
+        run_as_pguser touch "${PGDATA}/standby.signal"
+    fi
+
     # Check if we need to do recovery
     if [ -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Starting PostgreSQL as standby"
@@ -2675,6 +2710,207 @@ check_replication_lag() {
     return 0
 }
 
+# Convert a PostgreSQL LSN ("X/Y", hexadecimal) to an integer.
+# Prints nothing and returns 1 if the value is not a valid LSN.
+lsn_to_int() {
+    local lsn="$1"
+    case "$lsn" in
+        [0-9A-Fa-f]*/[0-9A-Fa-f]*) ;;
+        *) return 1 ;;
+    esac
+    case "${lsn%%/*}${lsn##*/}" in
+        *[!0-9A-Fa-f]*) return 1 ;;
+    esac
+    echo $(( (16#${lsn%%/*} << 32) + 16#${lsn##*/} ))
+}
+
+# Compare two data states (timeline, then LSN). Prints newer|older|equal from
+# the point of view of the FIRST state; returns 1 on invalid input.
+data_state_compare() {
+    local tli_a="$1" lsn_a="$2" tli_b="$3" lsn_b="$4" ia ib
+    case "$tli_a$tli_b" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    [ -n "$tli_a" ] && [ -n "$tli_b" ] || return 1
+    ia=$(lsn_to_int "$lsn_a") || return 1
+    ib=$(lsn_to_int "$lsn_b") || return 1
+    if [ "$tli_a" -gt "$tli_b" ]; then echo newer
+    elif [ "$tli_a" -lt "$tli_b" ]; then echo older
+    elif [ "$ia" -gt "$ib" ]; then echo newer
+    elif [ "$ia" -lt "$ib" ]; then echo older
+    else echo equal
+    fi
+}
+
+# Decide whether this standby may be promoted while the peer is a cluster member.
+# Arguments: local_tli local_lsn peer_tli|unknown peer_lsn|unknown local_name
+#            peer_name waited_seconds limit_seconds
+# Prints promote | refuse | wait | promote-peer-unreachable
+promotion_decision() {
+    local l_tli="$1" l_lsn="$2" p_tli="$3" p_lsn="$4" l_name="$5" p_name="$6"
+    local waited="$7" limit="$8" cmp
+
+    if [ "$p_tli" = "unknown" ] || [ "$p_lsn" = "unknown" ]; then
+        cmp=""
+    else
+        cmp=$(data_state_compare "$l_tli" "$l_lsn" "$p_tli" "$p_lsn") || cmp=""
+    fi
+
+    case "$cmp" in
+        newer) echo promote ;;
+        older) echo refuse ;;
+        equal)
+            # Same data state: the node with the smaller cluster name wins, the
+            # other refuses. Both nodes compute the same order.
+            if [ "$l_name" \< "$p_name" ]; then echo promote; else echo refuse; fi
+            ;;
+        *)
+            if [ "$waited" -ge "$limit" ]; then echo promote-peer-unreachable; else echo wait; fi
+            ;;
+    esac
+}
+
+# Name of the other cluster member (empty if the peer is not a member).
+get_peer_member_name() {
+    local me
+    command -v crm_node >/dev/null 2>&1 || return 1
+    me=$(get_cluster_node_name)
+    crm_node -l 2>/dev/null | awk -v me="$me" '$3 == "member" && $2 != me { print $2; exit }'
+}
+
+# True if the peer is leaving the cluster in an orderly way (Pacemaker shutdown
+# in progress or standby): it will not provide a data state any more, so the
+# comparison must not wait for it. A clean shutdown flushes all WAL to the
+# standby first, so the node that stays has everything that was acknowledged.
+peer_is_leaving() {
+    local peer="$1" sd sb
+    command -v crm_attribute >/dev/null 2>&1 || return 1
+    sd=$(crm_attribute -N "$peer" -n shutdown -G -l reboot -q 2>/dev/null)
+    case "$sd" in ""|0) ;; *[!0-9]*) ;; *) return 0 ;; esac
+    sb=$(crm_attribute -N "$peer" -n standby -G -q 2>/dev/null)
+    case "$sb" in on|true|yes|1) return 0 ;; esac
+    return 1
+}
+
+# Print "<timeline> <lsn>" of a node (empty host = local socket).
+# The LSN is the replay position of a standby or the current position of a
+# primary. Returns 1 if the node does not answer or the answer is not valid.
+query_data_state() {
+    local host="$1" hostopts="" rep_user out
+    if [ -n "$host" ]; then
+        rep_user=$(get_replication_user)
+        hostopts="-h ${host} -U ${rep_user} -d postgres"
+    fi
+    out=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc \"SELECT (SELECT timeline_id FROM pg_control_checkpoint()) || ' ' || CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text ELSE pg_current_wal_lsn()::text END\"" 2>/dev/null) || return 1
+    case "$out" in
+        [0-9]*" "[0-9A-Fa-f]*/[0-9A-Fa-f]*) echo "$out"; return 0 ;;
+    esac
+    return 1
+}
+
+# Two queries 2 seconds apart. Prints "<tli> <lsn>" and returns 0 if both are
+# equal (stable), 2 if the position still advances, 1 if the node does not answer.
+query_stable_data_state() {
+    local host="$1" first second
+    first=$(query_data_state "$host") || return 1
+    sleep 2
+    second=$(query_data_state "$host") || return 1
+    echo "$second"
+    [ "$first" = "$second" ] && return 0
+    return 2
+}
+
+# True if a node without standby.signal should start as standby: the data-state
+# comparison is enabled, the peer is a cluster member and no primary is running.
+start_as_standby_for_data_comparison() {
+    local wait_max="${OCF_RESKEY_promotion_peer_wait:-60}"
+    case "$wait_max" in ""|*[!0-9]*) wait_max=60 ;; esac
+    [ "$wait_max" -gt 0 ] || return 1
+    [ -n "$(get_peer_member_name)" ] || return 1
+    [ -z "$(discover_promoted_node 2>/dev/null)" ] || return 1
+    return 0
+}
+
+# Promotion guard for a standby without a reachable primary: compare the data
+# state with the peer if the peer is a cluster member. Returns 0 to continue
+# with the existing checks, 1 to refuse the promotion.
+promotion_data_state_guard() {
+    local wait_max="${OCF_RESKEY_promotion_peer_wait:-60}" hard_max=100
+    local peer local_name waited=0 limit local_state peer_state rc lrc decision
+    local l_tli l_lsn p_tli="unknown" p_lsn="unknown" start=$SECONDS
+
+    case "$wait_max" in ""|*[!0-9]*) wait_max=60 ;; esac
+    [ "$wait_max" -gt 0 ] || return 0
+
+    peer=$(get_peer_member_name)
+    [ -n "$peer" ] || return 0
+
+    # Only relevant when no primary is running anywhere
+    if [ -n "$(discover_promoted_node 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    local_name=$(get_cluster_node_name)
+    limit=$wait_max
+    [ "$limit" -le "$hard_max" ] || limit=$hard_max
+
+    local peer_host
+    peer_host=$(resolve_cluster_node_to_hostname "$peer")
+
+    while true; do
+        local_state=$(query_stable_data_state ""); lrc=$?
+        if [ -z "$local_state" ]; then
+            ocf_log warn "promotion-by-data-state: cannot read local data state, using existing checks only"
+            return 0
+        fi
+        if [ $lrc -eq 2 ] && [ $((SECONDS - start)) -lt $hard_max ]; then
+            # local recovery still advances: wait until the position is stable
+            sleep 1
+            continue
+        fi
+        l_tli=${local_state%% *}
+        l_lsn=${local_state##* }
+
+        peer_state=$(query_stable_data_state "$peer_host"); rc=$?
+        p_tli="unknown"; p_lsn="unknown"
+        if [ $rc -eq 0 ] && [ -n "$peer_state" ]; then
+            p_tli=${peer_state%% *}
+            p_lsn=${peer_state##* }
+        elif [ $rc -eq 2 ]; then
+            # position still advances (crash recovery): wait longer, up to the hard limit
+            limit=$hard_max
+        fi
+        waited=$((SECONDS - start))
+
+        decision=$(promotion_decision "$l_tli" "$l_lsn" "$p_tli" "$p_lsn" "$local_name" "$peer" "$waited" "$limit")
+        case "$decision" in
+            wait)
+                if [ "$p_tli" = "unknown" ] && peer_is_leaving "$peer"; then
+                    ocf_log warn "promotion-by-data-state: decision=promote-peer-leaving local=${l_tli}/${l_lsn} peer=unknown tiebreak=no waited=${waited}s"
+                    ocf_log warn "Peer ${peer} is shutting down or in standby; promoting this node without waiting"
+                    return 0
+                fi
+                sleep 3
+                continue
+                ;;
+            promote)
+                ocf_log info "promotion-by-data-state: decision=promote local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_tli/$p_lsn" = "$l_tli/$l_lsn" ] && echo yes || echo no) waited=${waited}s"
+                return 0
+                ;;
+            refuse)
+                ocf_log warn "promotion-by-data-state: decision=refuse local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_tli/$p_lsn" = "$l_tli/$l_lsn" ] && echo yes || echo no) waited=${waited}s"
+                ocf_log warn "Peer ${peer} has the newer (or preferred equal) data state, not promoting this node"
+                return 1
+                ;;
+            promote-peer-unreachable)
+                ocf_log warn "promotion-by-data-state: decision=promote-peer-unreachable local=${l_tli}/${l_lsn} peer=unknown tiebreak=no waited=${waited}s"
+                ocf_log warn "Peer ${peer} is a cluster member but gave no usable data state within ${waited}s; promoting this node, data newer on the peer will be lost"
+                return 0
+                ;;
+        esac
+    done
+}
+
 check_promotion_safety() {
     # Check if it's safe to promote this standby node
     # Returns: 0 = safe to promote
@@ -2733,6 +2969,10 @@ check_promotion_safety() {
             fi
         fi
     fi
+
+    # Data-state guard: a stale standby must not win against a peer that holds
+    # newer data (staggered shutdown of both nodes, see promotion_decision)
+    promotion_data_state_guard || return 1
 
     # Check if we're in sync mode
     if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
