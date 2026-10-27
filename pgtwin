@@ -1709,6 +1709,20 @@ set_promotion_eligibility() {
     fi
 }
 
+# True only if the peer answers and is a standby itself. Then no primary exists
+# anywhere: a standby whose replication is "unhealthy" in that state is not lagging
+# behind a healthy primary, it simply has nothing to replicate from (cold start of both
+# nodes, or a failover that has not promoted yet). Anything else, in particular a peer
+# that does not answer, is not proof and returns false.
+no_primary_in_cluster() {
+    local peer peer_host state
+    peer=$(get_peer_member_name) || return 1
+    [ -n "$peer" ] || return 1
+    peer_host=$(resolve_cluster_node_to_hostname "$peer") || return 1
+    state=$(run_as_pguser sh -c "${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
+    [ "$state" = "t" ]
+}
+
 pgsql_monitor() {
     local rc
 
@@ -1848,6 +1862,20 @@ pgsql_monitor() {
 
             return $OCF_SUCCESS
         else
+            # No primary exists (the peer is a standby as well): there is nothing
+            # this node could replicate from, so the veto below would only keep
+            # both nodes from ever being promoted. Stay eligible and let the
+            # promotion decision (data state of both nodes) pick one. Without
+            # this a cold start of both nodes can end with no primary at all: the
+            # node that the data-state tie-break prefers has already vetoed itself
+            # and the other one correctly refuses.
+            if no_primary_in_cluster; then
+                ocf_log info "Replication cannot be healthy: no primary exists (the peer is a standby too); staying eligible for promotion"
+                ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+                set_promotion_eligibility "eligible"
+                return $OCF_SUCCESS
+            fi
+
             # dmkif (self-healing, see pgtwin#3): this node's replication is
             # not known-good right now. Actively refuse promotion candidacy
             # by forcing its promotion score to -INFINITY, which overrides
