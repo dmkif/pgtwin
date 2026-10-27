@@ -1810,7 +1810,7 @@ pgsql_monitor() {
         # promotion_sync_state_guard()). Written only on transitions - see
         # update_confirmed_sync_attribute() for why.
         if [ "${OCF_RESKEY_rep_mode}" = "sync" ] && [ -n "${OCF_RESKEY_node_list}" ]; then
-            local confirmed_now=$(get_confirmed_sync_standby)
+            local confirmed_now=$(node_name_for_application_name "$(get_confirmed_sync_standby)")
             local local_node_for_sync=$(get_cluster_node_name)
             for peer_node in ${OCF_RESKEY_node_list}; do
                 [ "$peer_node" = "$local_node_for_sync" ] && continue
@@ -2968,6 +2968,37 @@ get_confirmed_sync_standby() {
     \"" 2>/dev/null
 }
 
+# Map a PostgreSQL application_name back to the cluster node it belongs to.
+# get_application_name() derives the name from the hostname and turns every
+# '-' into '_' (hyphens are not allowed in application_name), so node "pg-b"
+# shows up in pg_stat_replication as "pg_b". node_list holds the real node
+# names; comparing them directly never matches on hyphenated node names.
+# Prints the node name, or nothing (return 1) if no node_list entry maps to it.
+node_name_for_application_name() {
+    local app="$1" n
+    [ -n "$app" ] || return 1
+    for n in ${OCF_RESKEY_node_list}; do
+        if [ "$(echo "$n" | tr '-' '_')" = "$app" ]; then
+            echo "$n"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Replication target for a demote: the confirmed-sync standby as a cluster node,
+# but never this node itself (that would write a self-referential
+# primary_conninfo, see the self-discovery check in pgsql_demote()).
+# Prints nothing if the name cannot be mapped or maps to this node.
+confirmed_sync_standby_as_node() {
+    local node
+    node=$(node_name_for_application_name "$1") || return 1
+    if [ "$node" = "$(get_cluster_node_name)" ] || [ "$node" = "$(hostname)" ]; then
+        return 1
+    fi
+    echo "$node"
+}
+
 # dmkif-followup: persist whether a given standby node is CURRENTLY
 # confirmed sync_state='sync', so a node promoting with no reachable primary
 # can read the peer's last-known confirmed-sync status even when it cannot
@@ -3355,8 +3386,8 @@ pgsql_demote() {
     # show as Promoted (the gap the self-discovery/node_list fallbacks below
     # otherwise cannot close during a routine planned failover).
     if [ -z "$primary_host" ] && [ -n "$synced_standby" ]; then
-        primary_host=$(resolve_cluster_node_to_hostname "$synced_standby" 2>/dev/null)
-        [ -n "$primary_host" ] && ocf_log info "Using confirmed-sync standby '${synced_standby}' as replication target"
+        primary_host=$(confirmed_sync_standby_as_node "$synced_standby")
+        [ -n "$primary_host" ] && ocf_log info "Using confirmed-sync standby '${synced_standby}' (${primary_host}) as replication target"
     fi
 
     if [ -z "$primary_host" ]; then
