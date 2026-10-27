@@ -90,6 +90,7 @@ OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
 OCF_RESKEY_promotion_peer_wait_default="60"
+OCF_RESKEY_force_demote_default="false"
 OCF_RESKEY_vip_default=""
 OCF_RESKEY_container_mode_default="false"
 OCF_RESKEY_pg_major_version_default=""
@@ -112,6 +113,7 @@ OCF_RESKEY_container_image_default="registry.opensuse.org/devel/bci/tumbleweed/c
 : ${OCF_RESKEY_pgpassfile=${OCF_RESKEY_pgpassfile_default}}
 : ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
 : ${OCF_RESKEY_promotion_peer_wait=${OCF_RESKEY_promotion_peer_wait_default}}
+: ${OCF_RESKEY_force_demote=${OCF_RESKEY_force_demote_default}}
 : ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
 : ${OCF_RESKEY_container_mode=${OCF_RESKEY_container_mode_default}}
 : ${OCF_RESKEY_pg_major_version=${OCF_RESKEY_pg_major_version_default}}
@@ -453,6 +455,25 @@ Default: false
 </longdesc>
 <shortdesc lang="en">Force unsafe promotion</shortdesc>
 <content type="boolean" default="${OCF_RESKEY_force_promotion_default}" />
+</parameter>
+
+<parameter name="force_demote" unique="0">
+<longdesc lang="en">
+Force demotion even when no standby is currently confirmed synchronous
+(sync_state='sync' on this primary's own pg_stat_replication).
+
+DANGER: Setting this to true bypasses the demotion safety check added to
+prevent relinquishing primary status with no confirmed-complete standby to
+hand off to. This can leave the cluster with no primary holding the latest
+data and no standby proven to have all of it.
+
+Only use this in emergency/maintenance scenarios where you must force the
+role change despite the standby not being confirmed caught up.
+
+Default: false
+</longdesc>
+<shortdesc lang="en">Force unsafe demotion</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_force_demote_default}" />
 </parameter>
 
 </parameters>
@@ -1783,6 +1804,24 @@ pgsql_monitor() {
         # Check replication slots on primary
         check_replication_slots
 
+        # dmkif-followup: persist which standby (if any) is currently
+        # confirmed sync_state='sync', so a future promotion decision can
+        # fall back to this if the primary can't be queried live (see
+        # promotion_sync_state_guard()). Written only on transitions - see
+        # update_confirmed_sync_attribute() for why.
+        if [ "${OCF_RESKEY_rep_mode}" = "sync" ] && [ -n "${OCF_RESKEY_node_list}" ]; then
+            local confirmed_now=$(get_confirmed_sync_standby)
+            local local_node_for_sync=$(get_cluster_node_name)
+            for peer_node in ${OCF_RESKEY_node_list}; do
+                [ "$peer_node" = "$local_node_for_sync" ] && continue
+                if [ "$peer_node" = "$confirmed_now" ]; then
+                    update_confirmed_sync_attribute "$peer_node" "1"
+                else
+                    update_confirmed_sync_attribute "$peer_node" "0"
+                fi
+            done
+        fi
+
         # DYNAMIC UPDATE v1.6.18: Update synchronous_standby_names based on cluster topology
         # This adapts to standbys connecting/disconnecting and cluster changes
         if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
@@ -1993,10 +2032,13 @@ check_replication_slots() {
 
         if [ $drop_rc -eq 0 ]; then
             ocf_log info "Replication slot ${OCF_RESKEY_slot_name} dropped successfully"
-
-            # Mark that full resync is needed
-            run_as_pguser touch "${PGDATA}/.need_full_resync"
-            ocf_log info "Created .need_full_resync marker - standby will trigger pg_basebackup"
+            # dmkif-followup: removed the ".need_full_resync" marker here -
+            # it was written to THIS (primary's) local PGDATA, never read by
+            # any code path, and could never be read by the standby anyway
+            # (separate host, separate local storage, no shared PGDATA in
+            # this architecture). The standby-start WAL-removed detection in
+            # pgsql_start() (standby_start_failed_for_missing_wal) is what
+            # actually handles recovery for this case now.
         else
             ocf_log err "Failed to drop replication slot ${OCF_RESKEY_slot_name} (rc=$drop_rc)"
         fi
@@ -2911,6 +2953,103 @@ promotion_data_state_guard() {
     done
 }
 
+# dmkif-followup: returns the application_name of a standby currently
+# confirmed sync_state='sync' on THIS node's own pg_stat_replication, or
+# nothing if none qualifies. Local, non-blocking SQL query - safe to call
+# from demote() before relinquishing primary status, and from the monitor
+# loop to track transitions. Per-codebase convention, application_name is
+# expected to match the standby's cluster node name (see
+# get_safe_synchronous_standby_names()).
+get_confirmed_sync_standby() {
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+        SELECT application_name FROM pg_stat_replication
+        WHERE sync_state='sync' AND state='streaming'
+        LIMIT 1
+    \"" 2>/dev/null
+}
+
+# dmkif-followup: persist whether a given standby node is CURRENTLY
+# confirmed sync_state='sync', so a node promoting with no reachable primary
+# can read the peer's last-known confirmed-sync status even when it cannot
+# query the peer directly (e.g. corosync/CIB still healthy, but the
+# Postgres-specific path between the nodes is down). Written only on
+# observed transitions, not every monitor cycle: a persistent (non "-l
+# reboot") node attribute is a genuine CIB configuration change, not a
+# lightweight attrd-backed transient one, so writing it on a fixed cadence
+# (vs. on actual state changes, which are rare relative to the monitor
+# interval) would add avoidable churn to Pacemaker's own CIB replication and
+# Policy Engine re-evaluation. Persistent (not reboot-scoped) is required
+# precisely so it survives the describing node's own reboot/crash - that is
+# the whole point of writing it at all.
+update_confirmed_sync_attribute() {
+    local standby_node="$1" new_value="$2" current
+
+    command -v crm_attribute >/dev/null 2>&1 || return 0
+
+    current=$(crm_attribute -N "$standby_node" -n "pgtwin-confirmed-synced" -G -q 2>/dev/null)
+    if [ "$current" != "$new_value" ]; then
+        crm_attribute -N "$standby_node" -n "pgtwin-confirmed-synced" -v "$new_value" >/dev/null 2>&1
+        ocf_log info "pgtwin-confirmed-synced for ${standby_node}: ${current:-<unset>} -> ${new_value}"
+    fi
+}
+
+# dmkif-followup: unified sync-mode promotion gate. Scoped to rep_mode=sync
+# specifically - under synchronous replication there are only two real
+# states: fully caught up (safe to promote, no further comparison needed -
+# the sync guarantee itself proves it), or known-behind (an accepted
+# double-failure case for the admin to resolve, not something to
+# probabilistically route around). For rep_mode=async, the existing
+# promotion_data_state_guard() (timeline/LSN comparison + bounded wait)
+# remains the mechanism, consistent with async's inherent data-loss
+# trade-off; this function is a no-op there.
+#
+# Returns 0 = safe to promote, 1 = refuse.
+promotion_sync_state_guard() {
+    [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 0
+    [ "${OCF_RESKEY_force_promotion}" = "true" ] && return 0
+
+    local local_name primary_host app_name sync_state cached
+    local_name=$(get_cluster_node_name)
+
+    # Live path: a primary is currently discoverable, ask it directly. This
+    # also covers the routine demote-then-promote maintenance case, where a
+    # live query resolves instantly - no bounded wait needed at all.
+    primary_host=$(discover_promoted_node)
+    if [ -n "$primary_host" ]; then
+        get_application_name
+        app_name="$APPLICATION_NAME"
+        sync_state=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -Atc \"
+            SELECT sync_state FROM pg_stat_replication
+            WHERE application_name='${app_name}' AND state='streaming'
+        \"" 2>/dev/null)
+
+        if [ "$sync_state" = "sync" ]; then
+            ocf_log info "promotion-sync-guard: live confirmation - ${local_name} is sync_state=sync on ${primary_host}"
+            return 0
+        fi
+
+        ocf_log warn "promotion-sync-guard: live check shows sync_state='${sync_state:-<none>}' on ${primary_host}, not confirmed sync - refusing"
+        return 1
+    fi
+
+    # No primary reachable: fall back to the last value persisted before
+    # going silent. Cached data here is a crisp, authoritatively-asserted
+    # fact (the former primary's own observation), not a self-reported,
+    # independently-advancing value - no staleness/trust-window reasoning
+    # is needed for rep_mode=sync specifically (see review notes).
+    if command -v crm_attribute >/dev/null 2>&1; then
+        cached=$(crm_attribute -N "$local_name" -n "pgtwin-confirmed-synced" -G -q 2>/dev/null)
+        if [ "$cached" = "1" ]; then
+            ocf_log info "promotion-sync-guard: cached confirmation - ${local_name} was last confirmed sync before going silent"
+            return 0
+        fi
+    fi
+
+    ocf_log warn "promotion-sync-guard: no live or cached confirmation that ${local_name} was ever synchronous"
+    ocf_log warn "This is the accepted double-failure case - refusing. Resolve manually or set force_promotion=true (DANGEROUS)"
+    return 1
+}
+
 check_promotion_safety() {
     # Check if it's safe to promote this standby node
     # Returns: 0 = safe to promote
@@ -2976,53 +3115,14 @@ check_promotion_safety() {
 
     # Check if we're in sync mode
     if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
-        ocf_log info "Promotion safety check: rep_mode=sync - checking synchronous replication state"
-
-        # Discover current primary to query sync state
-        local primary_host=$(discover_promoted_node)
-        if [ -z "$primary_host" ]; then
-            ocf_log warn "Cannot discover primary node to check sync state"
-            ocf_log warn "Allowing promotion (fail-open for cluster recovery scenarios)"
-            return 0
-        fi
-
-        # Get our application_name
-        local app_name
-        get_application_name
-        app_name="$APPLICATION_NAME"
-        ocf_log info "Checking if application_name='${app_name}' is synchronized on primary ${primary_host}"
-
-        # Query primary: Is this standby in sync state?
-        local sync_state=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -Atc \"
-            SELECT sync_state
-            FROM pg_stat_replication
-            WHERE application_name='${app_name}'
-                AND state='streaming'
-        \"" 2>/dev/null)
-
-        if [ "$sync_state" = "sync" ]; then
-            ocf_log info "✅ Promotion safety check PASSED: Node has sync_state='sync' (PostgreSQL guarantees caught up)"
-            return 0
-        elif [ "$sync_state" = "potential" ]; then
-            ocf_log warn "❌ Promotion safety check FAILED: Node has sync_state='potential' (still catching up to sync)"
-            ocf_log warn "Standby is connected and streaming but not yet fully synchronized"
-            ocf_log warn "Blocking promotion - will retry on next monitor cycle"
-            ocf_log warn "To force promotion anyway (DANGEROUS), set force_promotion=true"
-            return 1
-        elif [ "$sync_state" = "async" ]; then
-            ocf_log warn "❌ Promotion safety check FAILED: Node has sync_state='async' (not in synchronous replication)"
-            ocf_log warn "This can happen during startup while standby is catching up"
-            ocf_log warn "Blocking promotion until synchronous replication is established"
-            return 1
-        elif [ -z "$sync_state" ]; then
-            ocf_log warn "❌ Promotion safety check FAILED: Node not found in pg_stat_replication on primary"
-            ocf_log warn "Standby may not be connected or replication may not be active"
-            ocf_log warn "Blocking promotion - check replication connectivity"
-            return 1
-        else
-            ocf_log warn "❌ Promotion safety check FAILED: Unknown sync_state='${sync_state}'"
-            return 1
-        fi
+        # dmkif-followup: replaces the old ad-hoc "no primary discoverable ->
+        # fail-open" check with promotion_sync_state_guard(), which falls
+        # back to the persisted pgtwin-confirmed-synced CIB attribute instead
+        # of blindly allowing promotion when no primary can be queried live.
+        ocf_log info "Promotion safety check: rep_mode=sync - checking synchronous confirmation (live or cached)"
+        promotion_sync_state_guard || return 1
+        ocf_log info "✅ Promotion safety check PASSED"
+        return 0
     else
         # Async mode - check lag
         ocf_log info "Promotion safety check: rep_mode=async - checking replication lag"
@@ -3189,6 +3289,7 @@ pgsql_demote() {
     local primary_host=""
     local rep_user
     local app_name
+    local synced_standby
 
     rep_user=$(get_replication_user)
 
@@ -3201,6 +3302,31 @@ pgsql_demote() {
     fi
 
     ocf_log info "Demoting PostgreSQL to standby"
+
+    # dmkif-followup: confirm a synchronous, fully-caught-up standby actually
+    # exists before relinquishing primary status - otherwise there is no
+    # safe landing spot. This replaces relying on discover_promoted_node()
+    # to find an ALREADY-PROMOTED peer (further below) as the demote
+    # precondition: that check can never succeed during a routine planned
+    # failover, since the standby isn't promoted yet at the point demote()
+    # runs - it only looks like a safety check while actually just failing
+    # every ordinary maintenance failover. The check that is both available
+    # and actually answers the real question is local and non-blocking: is a
+    # standby confirmed sync_state='sync' on THIS node's own
+    # pg_stat_replication right now.
+    synced_standby=$(get_confirmed_sync_standby)
+    if [ -z "$synced_standby" ]; then
+        if [ "${OCF_RESKEY_force_demote}" = "true" ]; then
+            ocf_log warn "⚠️  FORCED DEMOTE - no confirmed synchronous standby found! This may leave no safe failover target!"
+        else
+            ocf_log err "Refusing to demote: no standby is currently confirmed synchronous (sync_state='sync')"
+            ocf_log err "Demoting now could leave no confirmed-complete standby to hand off to"
+            ocf_log err "Resolve replication lag/connectivity first, or set force_demote=true to override (DANGEROUS)"
+            return $OCF_ERR_GENERIC
+        fi
+    else
+        ocf_log info "Confirmed synchronous standby '${synced_standby}' - safe to demote"
+    fi
 
     # Enhanced promoted node discovery (v1.6)
     # Try dynamic discovery first, then fall back to traditional methods
@@ -3221,6 +3347,16 @@ pgsql_demote() {
     if [ -n "$primary_host" ] && { [ "$primary_host" = "$local_node_name" ] || [ "$primary_host" = "$local_hostname" ]; }; then
         ocf_log warn "discover_promoted_node() returned this node itself ('${primary_host}') during demote - ignoring self-discovery, falling back"
         primary_host=""
+    fi
+
+    # dmkif-followup: the confirmed-sync standby from the check above is the
+    # correct replication target once demoted - it is about to be promoted
+    # and is already proven caught up, without needing anyone to already
+    # show as Promoted (the gap the self-discovery/node_list fallbacks below
+    # otherwise cannot close during a routine planned failover).
+    if [ -z "$primary_host" ] && [ -n "$synced_standby" ]; then
+        primary_host=$(resolve_cluster_node_to_hostname "$synced_standby" 2>/dev/null)
+        [ -n "$primary_host" ] && ocf_log info "Using confirmed-sync standby '${synced_standby}' as replication target"
     fi
 
     if [ -z "$primary_host" ]; then
