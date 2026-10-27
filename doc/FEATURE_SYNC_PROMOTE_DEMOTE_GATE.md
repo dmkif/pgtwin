@@ -10,6 +10,11 @@ Two checks that only apply with `rep_mode=sync`. With `rep_mode=async` the compa
 the log says `Refusing to demote`. `force_demote=true` skips the check. The confirmed standby is also the replication
 target of the demoted node.
 
+The check is skipped when the peer answers and is already a primary (`peer_is_primary()`). That is the old primary
+coming back after a failover: it has no synchronous standby because it is the stale one, it is started as a primary
+(no `standby.signal`), Pacemaker sees two promoted instances and asks it to demote. Refusing there keeps two primaries
+running and the node never rejoins; measured on a two-node cluster by killing the primary and restarting it.
+
 **Promote gate (`promotion_sync_state_guard()`).** A standby may become primary if either
 1. a primary is reachable and reports this node as `sync` (live), or
 2. no primary is reachable and the attribute `pgtwin-confirmed-synced` of this node is `1` (cached).
@@ -47,6 +52,13 @@ cached promotion decision refuse. `test/test-sync-gate.sh` covers this with hyph
   value; a node with value `0` that was the last primary needs `force_promotion=true`.
 - **Cost.** One local `psql` query and one `crm_attribute -G` per peer in every `Promoted` monitor (about 40 ms and 30 ms
   on a small VM, measured). A `crm_attribute` write happens only when the state of a standby changes.
+
+## Cold start
+
+With `rep_mode=sync` the cached attribute decides after a full outage as well. A node that has been primary since the
+cluster was created has no value until it has been a standby once. The data-state comparison runs first, so the node
+with the newer data is the candidate, but a candidate with a `0` or no value still needs `force_promotion=true`. Check
+`crm_attribute -N <node> -n pgtwin-confirmed-synced -G -q` on both nodes before a planned stop of the whole cluster.
 
 ## Tests
 
