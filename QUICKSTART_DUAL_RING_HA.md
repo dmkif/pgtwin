@@ -902,8 +902,10 @@ sudo crm configure property stonith-enabled=false
 # Enable cluster startup
 sudo crm configure property no-quorum-policy=ignore
 
-# Set PostgreSQL as preferred on psql1
-sudo crm configure property default-resource-stickiness=100
+# Resource stickiness. Use rsc_defaults: the cluster property default-resource-stickiness is ignored by
+# current Pacemaker (measured with crm_simulate on 3.0.3, the scores do not change). 50 is the value that
+# keeps the connectivity failover working with the locations used below, see QUICKSTART.md section 2.11.
+sudo crm configure rsc_defaults resource-stickiness=50
 ```
 
 **Important**: For production, consider implementing proper fencing:
@@ -967,11 +969,9 @@ clone ping-clone ping-gateway \
     meta clone-max="2" clone-node-max="1"
 
 # Resource stickiness - prevent unnecessary failback
-# Stickiness=100 means "prefer to stay on current node"
-# Combined with location constraints (psql1:100, psql2:50):
-#   - Fresh start: prefers psql1 (100 > 50)
-#   - After failover to psql2: stays on psql2 (50+100 > 100)
-rsc_defaults resource-stickiness=100
+# The Promoted role gets the stickiness twice (directly and through the colocated VIP), so it has to stay
+# below 75 here (locations 100/50, pingd bonus 200); 50 keeps both failback protection and connectivity failover.
+rsc_defaults resource-stickiness=50
 
 # Base location constraints (prefer psql1)
 location prefer-psql1 postgres-clone role=Promoted 100: psql1

@@ -34,12 +34,17 @@ property cib-bootstrap-options: \
     cluster-recheck-interval=2min
 
 # Resource defaults - prevent unnecessary failback
-# Stickiness=100 means "prefer to stay on current node"
-# This prevents automatic failback when failed node recovers
-# Combined with location constraints (psql1:100, psql2:50):
-#   - Fresh start: prefers psql1 (100 > 50)
-#   - After failover to psql2: stays on psql2 (50+100 > 100)
-rsc_defaults resource-stickiness=100
+# Stickiness is a bonus for the node a resource currently runs on. The Promoted role of the database gets it
+# twice, once directly and once through the VIP, because the VIP is colocated with the Promoted role
+# (measured with crm_simulate on Pacemaker 3.0.3). The score of the node that holds the Promoted role is:
+#   location + master-score (10) + 200 (if pingd > 0) + 2 x stickiness
+# Two limits follow for locations psql1:100 / psql2:50 and the pingd bonus of 200:
+#   - no failback after recovery:               2 x stickiness >= 100 - 50          -> stickiness >= 25
+#   - failover when the primary loses the ping: 100 + 10 + 2 x stickiness < 50 + 10 + 200 -> stickiness < 75
+# 50 sits in the middle. The previous value of 100 is above the second limit: a primary that lost its gateway
+# ping then stays Promoted and the connected standby is not promoted. Check a changed value with
+# `crm_simulate -sL` (see doc/FEATURE_SYNC_PROMOTE_DEMOTE_GATE.md).
+rsc_defaults resource-stickiness=50
 
 # Define the virtual IP for PostgreSQL clients
 primitive postgres-vip IPaddr2 \

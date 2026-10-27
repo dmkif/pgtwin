@@ -695,12 +695,11 @@ sudo crm configure clone ping-clone ping-gateway \
 ### 2.11 Create Constraints
 
 ```bash
-# Set resource stickiness to prevent unnecessary failback
-# Stickiness=100 means "prefer to stay on current node"
-# Combined with location constraints (psql1:100, psql2:50):
-#   - Fresh start: prefers psql1 (100 > 50)
-#   - After failover to psql2: stays on psql2 (50+100 > 100)
-sudo crm configure rsc_defaults resource-stickiness=100
+# Set resource stickiness to prevent unnecessary failback.
+# Use rsc_defaults: the old cluster property default-resource-stickiness is ignored by current Pacemaker.
+# The Promoted role gets the stickiness twice (directly and through the colocated VIP), so the value has to
+# stay below 75 for these locations, otherwise a primary without connectivity is not replaced (see below).
+sudo crm configure rsc_defaults resource-stickiness=50
 
 # ⚠️ CRITICAL: VIP MUST run on same node as promoted database
 # This colocation constraint ensures VIP follows promoted (primary) instance
@@ -726,26 +725,34 @@ sudo crm configure location prefer-connected-promoted postgres-clone role=Promot
 
 **How resource placement works:**
 
-**Resource stickiness (prevents unnecessary failback):**
-- Stickiness=100 adds 100 points to the currently running node
-- Prevents automatic migration back to preferred node after recovery
-- Example: psql2 is primary after failover → psql2 score: 50+100=150 > psql1: 100
+**Scoring of the Promoted role** (measured with `crm_simulate` on Pacemaker 3.0.3, VIP colocated with the Promoted role):
+
+`score = location + 10 (master-score) + 200 (if pingd > 0) + 2 x stickiness` for the node that holds the Promoted role,
+`score = location + 10 + 200 (if pingd > 0)` for the other node. The stickiness counts twice because the VIP is colocated
+with the Promoted role and is sticky itself.
+
+**Resource stickiness (prevents unnecessary failback, must not block the connectivity failover):**
+- Stickiness=50 adds 2 x 50 = 100 points to the node that is currently primary
+- Prevents automatic migration back to the preferred node after recovery: needs `2 x stickiness >= 100 - 50` (a tie keeps the current primary), so stickiness >= 25
+- Must stay below the connectivity bonus: `100 + 10 + 2 x stickiness < 50 + 10 + 200`, so stickiness < 75
+- With stickiness 100 (the old default) a primary that lost its gateway ping keeps the Promoted role: 310 against 260
 - Admin can still manually migrate: `sudo crm resource move postgres-clone psql1`
 
-**Initial placement (fresh cluster start):**
-- psql1: 100 (location) + 0 (not running) = 100
-- psql2: 50 (location) + 0 (not running) = 50
-- Result: psql1 becomes primary
+**Initial placement (fresh cluster start):** no node is the current primary, so only the location decides: psql1 (100) is preferred over psql2 (50).
 
-**After failover (psql2 is now primary):**
-- psql1: 100 (location) + 0 (not running) = 100
-- psql2: 50 (location) + 100 (stickiness) = 150
+**After failover (psql2 is now primary), both connected:**
+- psql1: 100 + 10 + 200 = 310
+- psql2: 50 + 10 + 200 + 100 (2 x stickiness) = 360
 - Result: psql2 stays primary (prevents automatic failback)
 
-**Connectivity-based placement:**
-- Nodes with working connectivity: base score (100/50) + stickiness (0/100) + connectivity (200) = 300/350
-- Nodes without connectivity: base score (100/50) + stickiness (0/100) = 100/150
-- Cluster prefers to run primary on connected nodes
+**Primary loses connectivity (psql1 is primary, ping lost):**
+- psql1: 100 + 10 + 100 (2 x stickiness) = 210
+- psql2: 50 + 10 + 200 = 260
+- Result: the connected standby is promoted
+
+Check any change with the live CIB before you rely on it: `sudo crm_simulate -sL | grep "promotion score"`; to try the
+connectivity case, copy the CIB (`cibadmin -Q > /tmp/c.xml`), set `pingd` to 0 on the primary
+(`CIB_file=/tmp/c.xml crm_attribute -N <primary> -n pingd -v 0 -l reboot`) and run `crm_simulate -x /tmp/c.xml -s`.
 
 ### 2.12 Verify Configuration
 
