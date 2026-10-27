@@ -15,7 +15,7 @@ extract() {
         p && /^}/ { p=0 }
     ' "$AGENT"
 }
-for f in update_confirmed_sync_attribute promotion_sync_state_guard; do
+for f in update_confirmed_sync_attribute promotion_sync_state_guard peer_is_primary; do
     code=$(extract $f)
     [ -n "$code" ] || { echo "FAIL: function $f not found in agent"; exit 1; }
     eval "$code"
@@ -51,17 +51,19 @@ get_cluster_node_name() { echo "$FAKE_NODE"; }
 hostname() { echo "$FAKE_NODE"; }
 get_application_name() { APPLICATION_NAME=$(echo "$FAKE_NODE" | tr '-' '_'); }
 discover_promoted_node() { echo "$FAKE_PRIMARY"; }
+resolve_cluster_node_to_hostname() { echo "$1"; }
+get_peer_member_name() { echo "$FAKE_PEER"; }
 get_confirmed_sync_standby() { echo "$FAKE_CONFIRMED"; }
 run_as_pguser() { "$@"; }
-PSQL="$STORE/fake-psql"; printf '#!/bin/sh\necho "$FAKE_SYNC_STATE"\n' > "$PSQL"; chmod +x "$PSQL"
+PSQL="$STORE/fake-psql"; printf '#!/bin/sh\ncase "$*" in *pg_is_in_recovery*) echo "$FAKE_IN_RECOVERY";; *) echo "$FAKE_SYNC_STATE";; esac\n' > "$PSQL"; chmod +x "$PSQL"
 
 fail=0
 check() {
     local desc="$1" expected="$2" actual="$3"
     if [ "$expected" = "$actual" ]; then echo "PASS: $desc"; else echo "FAIL: $desc (expected '$expected', got '$actual')"; fail=$((fail + 1)); fi
 }
-reset() { rm -f "$STORE"/*__*; FAKE_NODE=pg-a; FAKE_PRIMARY=; FAKE_CONFIRMED=; FAKE_SYNC_STATE=
-          OCF_RESKEY_node_list="pg-a pg-b"; OCF_RESKEY_rep_mode=sync; OCF_RESKEY_force_promotion=false; export FAKE_SYNC_STATE; }
+reset() { rm -f "$STORE"/*__*; FAKE_PEER=pg-b; FAKE_NODE=pg-a; FAKE_PRIMARY=; FAKE_CONFIRMED=; FAKE_SYNC_STATE=
+          OCF_RESKEY_node_list="pg-a pg-b"; OCF_RESKEY_rep_mode=sync; OCF_RESKEY_force_promotion=false; export FAKE_SYNC_STATE FAKE_IN_RECOVERY FAKE_PEER; }
 
 # ---- node_name_for_application_name ----
 reset
@@ -102,6 +104,12 @@ reset; FAKE_NODE=pg-b; FAKE_PRIMARY=pg-a; FAKE_SYNC_STATE=;          promotion_s
 reset; FAKE_NODE=pg-b; crm_attribute -N pg-b -n pgtwin-confirmed-synced -v 1; promotion_sync_state_guard; check "no primary, cached 1 -> promote" 0 $?
 reset; FAKE_NODE=pg-b; crm_attribute -N pg-b -n pgtwin-confirmed-synced -v 0; promotion_sync_state_guard; check "no primary, cached 0 -> refuse"  1 $?
 reset; FAKE_NODE=pg-b;                                                        promotion_sync_state_guard; check "no primary, unset -> refuse"     1 $?
+
+# ---- peer_is_primary (decides whether the demote needs the synchronous-standby check) ----
+reset; FAKE_IN_RECOVERY=f; peer_is_primary; check "peer is the primary: stale node may demote"   0 $?
+reset; FAKE_IN_RECOVERY=t; peer_is_primary; check "peer is a standby: check applies"            1 $?
+reset; FAKE_IN_RECOVERY=;  peer_is_primary; check "peer does not answer: check applies"         1 $?
+reset; FAKE_IN_RECOVERY=f; FAKE_PEER=;     peer_is_primary; check "no peer member: check applies" 1 $?
 
 # ---- end to end: what the primary records must be what the standby reads after the primary is gone ----
 reset; FAKE_NODE=pg-a; FAKE_CONFIRMED=pg_b; monitor_sync_block >/dev/null 2>&1   # primary pg-a observes pg-b as sync

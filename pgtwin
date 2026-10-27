@@ -2999,6 +2999,18 @@ confirmed_sync_standby_as_node() {
     echo "$node"
 }
 
+# True if the peer answers and is itself a primary. A node that comes back after a
+# failover (crash of the old primary, now stale) finds the peer already promoted: it has
+# no synchronous standby, because it is the one that has to rejoin, and it must demote.
+peer_is_primary() {
+    local peer peer_host state
+    peer=$(get_peer_member_name) || return 1
+    [ -n "$peer" ] || return 1
+    peer_host=$(resolve_cluster_node_to_hostname "$peer") || return 1
+    state=$(run_as_pguser sh -c "${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
+    [ "$state" = "f" ]
+}
+
 # dmkif-followup: persist whether a given standby node is CURRENTLY
 # confirmed sync_state='sync', so a node promoting with no reachable primary
 # can read the peer's last-known confirmed-sync status even when it cannot
@@ -3346,7 +3358,12 @@ pgsql_demote() {
     # standby confirmed sync_state='sync' on THIS node's own
     # pg_stat_replication right now.
     synced_standby=$(get_confirmed_sync_standby)
-    if [ -z "$synced_standby" ]; then
+    if [ -z "$synced_standby" ] && peer_is_primary; then
+        # Another node is already the primary: this is the stale old primary rejoining
+        # after a failover. The hand-off has happened without it; the check below would
+        # keep two primaries running.
+        ocf_log info "The peer is already the primary - demoting without the synchronous-standby check"
+    elif [ -z "$synced_standby" ]; then
         if [ "${OCF_RESKEY_force_demote}" = "true" ]; then
             ocf_log warn "⚠️  FORCED DEMOTE - no confirmed synchronous standby found! This may leave no safe failover target!"
         else
