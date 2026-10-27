@@ -55,10 +55,15 @@ cached promotion decision refuse. `test/test-sync-gate.sh` covers this with hyph
 
 ## Cold start
 
-With `rep_mode=sync` the cached attribute decides after a full outage as well. A node that has been primary since the
-cluster was created has no value until it has been a standby once. The data-state comparison runs first, so the node
-with the newer data is the candidate, but a candidate with a `0` or no value still needs `force_promotion=true`. Check
-`crm_attribute -N <node> -n pgtwin-confirmed-synced -G -q` on both nodes before a planned stop of the whole cluster.
+With `rep_mode=sync` the guard decides after a full outage as well. The data-state comparison runs first and names the
+candidate (newer data, or the smaller node name on equal data). The candidate then has to pass the guard: a node that
+was synchronous when the last primary saw it (`pgtwin-confirmed-synced=1`) may promote, and so may the node that was
+promoted last (`pgtwin-last-primary`, a persistent cluster attribute that the primary writes when it changes). The
+second rule matters for a node that has been primary since the cluster was created: only a primary writes the
+confirmed-synced value, and only for its peer, so such a node has none, while the data-state tie-break makes it the
+candidate and its peer refuses. Without the record no primary would start until `force_promotion=true` is set.
+Inspect with `crm_attribute -n pgtwin-last-primary -t crm_config -G -q` and
+`crm_attribute -N <node> -n pgtwin-confirmed-synced -G -q`.
 
 ## Tests
 

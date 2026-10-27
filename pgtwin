@@ -1810,6 +1810,7 @@ pgsql_monitor() {
         # promotion_sync_state_guard()). Written only on transitions - see
         # update_confirmed_sync_attribute() for why.
         if [ "${OCF_RESKEY_rep_mode}" = "sync" ] && [ -n "${OCF_RESKEY_node_list}" ]; then
+            record_last_primary
             local confirmed_now=$(node_name_for_application_name "$(get_confirmed_sync_standby)")
             local local_node_for_sync=$(get_cluster_node_name)
             for peer_node in ${OCF_RESKEY_node_list}; do
@@ -3011,6 +3012,23 @@ peer_is_primary() {
     [ "$state" = "f" ]
 }
 
+# Remember which node was the primary last, as a persistent cluster attribute, so that
+# promotion_sync_state_guard() can recognise "this node was the latest primary and nobody
+# was promoted since" (scenario (a) of the design). A node that has been primary since the
+# cluster was created has no pgtwin-confirmed-synced value (only a primary writes it, for
+# its peer), and after a full outage it would otherwise be refused here while its peer
+# refuses by the data-state comparison: no primary at all. Written only when it changes.
+record_last_primary() {
+    local me current
+    command -v crm_attribute >/dev/null 2>&1 || return 0
+    me=$(get_cluster_node_name)
+    current=$(crm_attribute -n "pgtwin-last-primary" -t crm_config -G -q 2>/dev/null)
+    if [ "$current" != "$me" ]; then
+        crm_attribute -n "pgtwin-last-primary" -t crm_config -v "$me" >/dev/null 2>&1
+        ocf_log info "pgtwin-last-primary: ${current:-<unset>} -> ${me}"
+    fi
+}
+
 # dmkif-followup: persist whether a given standby node is CURRENTLY
 # confirmed sync_state='sync', so a node promoting with no reachable primary
 # can read the peer's last-known confirmed-sync status even when it cannot
@@ -3081,6 +3099,10 @@ promotion_sync_state_guard() {
     # independently-advancing value - no staleness/trust-window reasoning
     # is needed for rep_mode=sync specifically (see review notes).
     if command -v crm_attribute >/dev/null 2>&1; then
+        if [ "$(crm_attribute -n "pgtwin-last-primary" -t crm_config -G -q 2>/dev/null)" = "$local_name" ]; then
+            ocf_log info "promotion-sync-guard: ${local_name} was the last primary and nobody was promoted since - no sync proof needed"
+            return 0
+        fi
         cached=$(crm_attribute -N "$local_name" -n "pgtwin-confirmed-synced" -G -q 2>/dev/null)
         if [ "$cached" = "1" ]; then
             ocf_log info "promotion-sync-guard: cached confirmation - ${local_name} was last confirmed sync before going silent"
@@ -3249,6 +3271,7 @@ pgsql_promote() {
     while [ $count -lt 30 ]; do
         if pgsql_is_promoted; then
             ocf_log info "PostgreSQL promoted successfully"
+            [ "${OCF_RESKEY_rep_mode}" = "sync" ] && record_last_primary
 
             # v1.7.0: Update application_name and synchronous_standby_names using ALTER SYSTEM
             update_application_name_in_config

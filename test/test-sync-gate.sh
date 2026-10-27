@@ -15,7 +15,7 @@ extract() {
         p && /^}/ { p=0 }
     ' "$AGENT"
 }
-for f in update_confirmed_sync_attribute promotion_sync_state_guard peer_is_primary; do
+for f in update_confirmed_sync_attribute promotion_sync_state_guard peer_is_primary record_last_primary; do
     code=$(extract $f)
     [ -n "$code" ] || { echo "FAIL: function $f not found in agent"; exit 1; }
     eval "$code"
@@ -41,9 +41,10 @@ ocf_log() { :; }
 crm_attribute() {   # file-backed: -N node -n name [-G -q | -v value]
     local n= k= v= g=0
     while [ $# -gt 0 ]; do
-        case "$1" in -N) n=$2; shift;; -n) k=$2; shift;; -v) v=$2; shift;; -G) g=1;; esac
+        case "$1" in -N) n=$2; shift;; -n) k=$2; shift;; -v) v=$2; shift;; -G) g=1;; -t) shift;; esac
         shift
     done
+    [ -n "$n" ] || n=cluster
     if [ $g = 1 ]; then [ -f "$STORE/${n}__${k}" ] && cat "$STORE/${n}__${k}"; return 0; fi
     echo "$v" > "$STORE/${n}__${k}"
 }
@@ -110,6 +111,20 @@ reset; FAKE_IN_RECOVERY=f; peer_is_primary; check "peer is the primary: stale no
 reset; FAKE_IN_RECOVERY=t; peer_is_primary; check "peer is a standby: check applies"            1 $?
 reset; FAKE_IN_RECOVERY=;  peer_is_primary; check "peer does not answer: check applies"         1 $?
 reset; FAKE_IN_RECOVERY=f; FAKE_PEER=;     peer_is_primary; check "no peer member: check applies" 1 $?
+
+# ---- scenario (a): the latest primary needs no sync proof ----
+reset; FAKE_NODE=pg-a; record_last_primary
+check "record_last_primary writes this node"                  pg-a "$(crm_attribute -n pgtwin-last-primary -t crm_config -G -q)"
+FAKE_NODE=pg-b; record_last_primary
+check "a promoted peer takes over the record"                 pg-b "$(crm_attribute -n pgtwin-last-primary -t crm_config -G -q)"
+reset; FAKE_NODE=pg-a; crm_attribute -n pgtwin-last-primary -t crm_config -v pg-a; promotion_sync_state_guard
+check "last primary, no value of its own, no primary -> promote" 0 $?
+reset; FAKE_NODE=pg-a; crm_attribute -n pgtwin-last-primary -t crm_config -v pg-b; promotion_sync_state_guard
+check "peer was the last primary, no value -> refuse"            1 $?
+reset; FAKE_NODE=pg-a; crm_attribute -n pgtwin-last-primary -t crm_config -v pg-b; crm_attribute -N pg-a -n pgtwin-confirmed-synced -v 1; promotion_sync_state_guard
+check "peer was the last primary, own flag 1 -> promote"         0 $?
+reset; FAKE_NODE=pg-a; FAKE_PRIMARY=pg-b; FAKE_SYNC_STATE=potential; crm_attribute -n pgtwin-last-primary -t crm_config -v pg-a; promotion_sync_state_guard
+check "a live primary exists: the record does not override it"   1 $?
 
 # ---- end to end: what the primary records must be what the standby reads after the primary is gone ----
 reset; FAKE_NODE=pg-a; FAKE_CONFIRMED=pg_b; monitor_sync_block >/dev/null 2>&1   # primary pg-a observes pg-b as sync
