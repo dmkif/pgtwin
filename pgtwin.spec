@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           pgtwin
-Version:        1.6.0
+Version:        1.7.12
 Release:        1
 Summary:        PostgreSQL 2-Node High Availability OCF Resource Agent
 License:        GPL-2.0-or-later

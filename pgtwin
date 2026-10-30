@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.7.5
-# Release Date: 2026-04-29
+# Version: 1.7.12
+# Release Date: 2026-10-30
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
@@ -133,8 +133,8 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.6.9">
-<version>1.6.9</version>
+<resource-agent name="pgtwin" version="1.7.12">
+<version>1.7.12</version>
 
 <longdesc lang="en">
 Resource agent for PostgreSQL with advanced replication slot management,
