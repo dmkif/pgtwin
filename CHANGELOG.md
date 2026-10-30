@@ -1,3 +1,14 @@
+## [1.7.12] - 2026-10-30
+
+### Fixed
+- **Hyphenated node names never matched their `application_name` in `synchronous_standby_names`**
+  - `get_safe_synchronous_standby_names()` compared the cluster node name (`pg-b`) with the connected `application_name` (`pg_b`, derived by `get_application_name()` with hyphens replaced by underscores). For every hyphenated node name the comparison failed, so each monitor of the primary logged `application_name mismatch between cluster and PG` and fell back to `synchronous_standby_names='*'`
+  - Fix: compare and list the `application_name`; FQDN node names are still shortened first
+  - Test: `test/test-safe-sync-names.sh` (2 of 5 cases fail without the fix)
+
+### Changed
+- Version strings brought up to date: agent header (was 1.7.5), resource-agent meta-data (was 1.6.9), `pgtwin.spec` (was 1.6.0)
+
 ## [1.7.11] - 2026-10-25
 
 ### Fixed
