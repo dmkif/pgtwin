@@ -566,13 +566,19 @@ get_safe_synchronous_standby_names() {
         # Example: "psql1.example.com" -> "psql1"
         local expected_short="${expected%%.*}"
 
+        # The standby's application_name is its hostname with hyphens replaced by
+        # underscores (get_application_name), so "pg-b" connects as "pg_b".
+        # Compare and list the application_name, not the node name; otherwise every
+        # hyphenated node name falls back to '*' and logs a mismatch warning each monitor.
+        local expected_app=$(echo "$expected_short" | tr '-' '_')
+
         # Check if this expected standby is actually connected and streaming
         # Compare using short hostname since PostgreSQL application_name uses hostname not FQDN
-        if echo "$connected_standbys" | grep -q "^${expected_short}$"; then
+        if echo "$connected_standbys" | grep -q "^${expected_app}$"; then
             if [ -z "$safe_standbys" ]; then
-                safe_standbys="$expected_short"
+                safe_standbys="$expected_app"
             else
-                safe_standbys="${safe_standbys}, ${expected_short}"
+                safe_standbys="${safe_standbys}, ${expected_app}"
             fi
         else
             if [ -z "$pending_standbys" ]; then
