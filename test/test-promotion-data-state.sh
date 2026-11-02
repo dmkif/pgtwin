@@ -68,4 +68,19 @@ grep -q "start_as_standby_for_data_comparison; then" "$AGENT" && check "former p
 
 grep -q "peer_is_leaving \"\$peer\"" "$AGENT" && check "leaving peer is not waited for" yes yes
 
+# Log format of the decision line (contract: specs/013 contracts/agent-interface.md). The lines are built inline in
+# check_promotion_safety(), so expand the variables with sample values and match the pattern.
+DEC_RE='^promotion-by-data-state: decision=(promote|refuse|promote-peer-unreachable|promote-peer-leaving) local=[0-9]+/[0-9A-F]+/[0-9A-F]+ peer=([0-9]+/[0-9A-F]+/[0-9A-F]+|unknown) tiebreak=(yes|no) waited=[0-9]+s$'
+dec_lines=$(grep 'ocf_log .*"promotion-by-data-state: decision=' "$AGENT" | sed -e 's/^.*ocf_log [a-z]* "//' -e 's/"[[:space:]]*$//')
+dec_count=0; dec_bad=0
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    dec_count=$((dec_count + 1))
+    sample=$(echo "$line" | sed -e 's/\${l_tli}/5/g; s/\${l_lsn}/0\/10/g; s/\${p_tli}/5/g; s/\${p_lsn}/0\/10/g; s/\${waited}/12/g' \
+                               -e 's/\$(\[.*echo no)/yes/')
+    echo "$sample" | grep -Eq "$DEC_RE" || { dec_bad=$((dec_bad + 1)); echo "  does not match the contract: $sample"; }
+done <<< "$dec_lines"
+check "decision log lines found in the agent (4 variants)" 4 "$dec_count"
+check "all decision log lines match the contract pattern" 0 "$dec_bad"
+
 if [ $fail -eq 0 ]; then echo "All tests passed"; exit 0; else echo "$fail test(s) failed"; exit 1; fi
