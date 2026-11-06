@@ -1,3 +1,12 @@
+## [1.7.13] - 2026-11-07
+
+### Fixed
+- **Cold start of both nodes could end without a primary**
+  - The standby monitor withdraws a node's promotion eligibility (`master-pgtwin-pg=-INFINITY`) as soon as its replication looks unhealthy. With no primary anywhere there is nothing to replicate from, so every standby looks unhealthy and vetoes itself. If the node that the data-state tie-break prefers has vetoed itself, and the other node correctly refuses, nobody is promoted (seen once in six cold starts of 1.7.11: no primary after 333 s; recovery needs `maintenance-mode`, a manual `pg_ctl promote` and resetting the attribute)
+  - Fix: `no_primary_in_cluster()`. If the peer answers and is a standby itself, the monitor keeps the node eligible and does not count a replication failure. In every other case, in particular when the peer does not answer, the veto is unchanged
+  - Deterministic check: promotion forbidden by a constraint on both nodes, both stacks restarted; without the fix the scores end at `-INFINITY`, with the fix at `10` on both nodes
+  - Tests: `test/test-cold-start-eligible.sh`
+
 ## [1.7.12] - 2026-10-30
 
 ### Fixed
